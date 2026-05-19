@@ -259,16 +259,11 @@ async function main(): Promise<void> {
     let done = 0
 
     const tasks: Task[] = mods.map((mod) => async () => {
+        if (!mod.has_download) return
         let files: ModFile[] = []
         try {
-            if (mod.download) {
-                files = [mod.download]
-            } else if (mod.has_download) {
-                await delay(API_DELAY_MS)
-                files = await listModFiles(mod.id)
-            } else {
-                return
-            }
+            await delay(API_DELAY_MS)
+            files = await listModFiles(mod.id)
         } catch (e) {
             errors.push(`mod ${mod.id}: failed to list files — ${e}`)
             return
