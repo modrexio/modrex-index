@@ -34,7 +34,7 @@ jobs:
         id: indexer
         run: |
           set +e
-          pnpm run build-index
+          pnpm build-index
           code=$?
           set -e
           if [ $code -eq 1 ]; then exit 1; fi
