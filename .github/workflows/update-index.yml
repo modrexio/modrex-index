@@ -26,9 +26,17 @@ jobs:
         run: gh release download latest-index --pattern index.db --output index.db 2>/dev/null || true
 
       - name: Run indexer
-        run: npm run build-index
+        id: indexer
+        run: |
+          set +e
+          npm run build-index
+          code=$?
+          set -e
+          if [ $code -eq 1 ]; then exit 1; fi
+          echo "changed=$([ $code -eq 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
 
       - name: Upload updated index
+        if: steps.indexer.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

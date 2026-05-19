@@ -257,6 +257,7 @@ async function main(): Promise<void> {
 
     const errors: string[] = []
     let done = 0
+    let newFiles = 0
 
     const tasks: Task[] = mods.map((mod) => async () => {
         if (!mod.has_download) return
@@ -282,7 +283,8 @@ async function main(): Promise<void> {
                 const sha256 = await hashUrl(file.download_url)
                 db.transaction(() => {
                     insertContent.run(sha256)
-                    insertFile.run(modId, sha256, file.id, file.version, new Date().toISOString())
+                    const { changes } = insertFile.run(modId, sha256, file.id, file.version, new Date().toISOString())
+                    if (changes > 0) newFiles++
                 })()
                 indexedFileIds.add(file.id)
             } catch (e) {
@@ -306,7 +308,7 @@ async function main(): Promise<void> {
     )
 
     const total = (db.prepare('SELECT COUNT(*) as n FROM files').get() as { n: number }).n
-    console.log(`\nDone. ${total} files in index.db`)
+    console.log(`\nDone. ${total} files in index.db (${newFiles} new this run)`)
 
     if (errors.length > 0) {
         console.log(`\n${errors.length} errors:`)
@@ -314,6 +316,11 @@ async function main(): Promise<void> {
     }
 
     db.close()
+
+    if (newFiles === 0) {
+        console.log('No new files — skipping upload.')
+        process.exit(2)
+    }
 }
 
 main().catch((e) => {
