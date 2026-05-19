@@ -11,7 +11,7 @@ The app downloads `index.db` on first launch (cached for 1 hour) and queries it 
 ## Running locally
 
 ```bash
-npm install
-npm run build-index
-npm run build-index -- --concurrency=10
+pnpm install
+pnpm run build-index
+pnpm run build-index -- --concurrency=10
 ```
