@@ -38,6 +38,7 @@ interface ModFile {
     version: string
     download_url: string
     type: string
+    updated_at: string
 }
 
 interface Paginated<T> {
@@ -178,8 +179,21 @@ async function listModsSince(since: Date | null): Promise<Mod[]> {
 }
 
 async function listModFiles(modId: number): Promise<ModFile[]> {
-    const result = await apiGet<Paginated<ModFile>>(`/mods/${modId}/files`)
-    return result.data
+    const files: ModFile[] = []
+    let page = 1
+    let lastPage = 1
+    do {
+        const result = await apiGet<Paginated<ModFile>>(`/mods/${modId}/files`, {
+            limit: 50,
+            page,
+        })
+        lastPage = result.meta.last_page
+        files.push(...result.data)
+        
+        page++
+        if (page <= lastPage) await delay(API_DELAY_MS)
+    } while (page <= lastPage)
+    return files
 }
 
 // --- hashing ---
@@ -275,8 +289,15 @@ async function main(): Promise<void> {
         const { id: modId } = getModId.get(sourceId, mod.id) as { id: number }
 
         for (const file of files) {
-            if (indexedFileIds.has(file.id)) continue
             if (!isPakFile(file.type)) continue
+            
+            if (indexedFileIds.has(file.id)) {
+                if (lastRunAt && new Date(file.updated_at) >= new Date(lastRunAt.getTime() - SINCE_BUFFER_MS)) {
+                    // File was updated recently, re-hash it to capture the new version
+                } else {
+                    continue
+                }
+            }
 
             try {
                 await delay(API_DELAY_MS)
