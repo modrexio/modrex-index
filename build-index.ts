@@ -292,9 +292,7 @@ async function main(): Promise<void> {
             if (!isPakFile(file.type)) continue
             
             if (indexedFileIds.has(file.id)) {
-                if (lastRunAt && new Date(file.updated_at) >= new Date(lastRunAt.getTime() - SINCE_BUFFER_MS)) {
-                    // File was updated recently, re-hash it to capture the new version
-                } else {
+                if (!lastRunAt || new Date(file.updated_at) < new Date(lastRunAt.getTime() - SINCE_BUFFER_MS)) {
                     continue
                 }
             }
