@@ -11,6 +11,7 @@
  */
 
 import Database, { type Database as DB } from 'better-sqlite3'
+import AdmZip from 'adm-zip'
 import { createHash } from 'crypto'
 import { join } from 'path'
 
@@ -196,24 +197,36 @@ async function listModFiles(modId: number): Promise<ModFile[]> {
     return files
 }
 
-// --- hashing ---
+// --- download + extraction ---
 
-async function hashUrl(downloadUrl: string): Promise<string> {
+async function downloadBuffer(downloadUrl: string): Promise<Buffer> {
     const res = await fetch(downloadUrl, {
         headers: { 'User-Agent': USER_AGENT },
         signal: AbortSignal.timeout(120_000),
     })
     if (!res.ok) throw new Error(`download ${res.status}`)
-    if (!res.body) throw new Error('no response body')
+    return Buffer.from(await res.arrayBuffer())
+}
 
-    const hash = createHash('sha256')
-    const reader = res.body.getReader()
-    while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        hash.update(value)
+// Returns SHA256(s) of all .pak content in buf.
+// If buf is a ZIP archive, extracts each .pak entry and hashes it individually.
+// Otherwise hashes the whole buffer (assumed to be a plain pak).
+function extractPakHashes(buf: Buffer): string[] {
+    const isZip =
+        buf.length >= 4 &&
+        buf[0] === 0x50 && buf[1] === 0x4b && buf[2] === 0x03 && buf[3] === 0x04
+    if (isZip) {
+        try {
+            const zip = new AdmZip(buf)
+            return zip
+                .getEntries()
+                .filter((e) => !e.isDirectory && e.entryName.toLowerCase().endsWith('.pak'))
+                .map((e) => createHash('sha256').update(e.getData()).digest('hex'))
+        } catch {
+            return []
+        }
     }
-    return hash.digest('hex')
+    return [createHash('sha256').update(buf).digest('hex')]
 }
 
 // --- concurrency pool ---
@@ -237,8 +250,15 @@ function delay(ms: number): Promise<void> {
     return new Promise((r) => setTimeout(r, ms))
 }
 
-function isPakFile(type: string): boolean {
-    return type.toLowerCase().includes('pak') || type === 'application/octet-stream' || type === ''
+function shouldDownload(type: string): boolean {
+    const t = type.toLowerCase()
+    return (
+        t.includes('pak') ||
+        t.includes('zip') ||
+        t === 'application/octet-stream' ||
+        t === 'application/zip' ||
+        t === ''
+    )
 }
 
 // --- main ---
@@ -289,8 +309,8 @@ async function main(): Promise<void> {
         const { id: modId } = getModId.get(sourceId, mod.id) as { id: number }
 
         for (const file of files) {
-            if (!isPakFile(file.type)) continue
-            
+            if (!shouldDownload(file.type)) continue
+
             if (indexedFileIds.has(file.id)) {
                 if (!lastRunAt || new Date(file.updated_at) < new Date(lastRunAt.getTime() - SINCE_BUFFER_MS)) {
                     continue
@@ -299,11 +319,15 @@ async function main(): Promise<void> {
 
             try {
                 await delay(API_DELAY_MS)
-                const sha256 = await hashUrl(file.download_url)
+                const buf = await downloadBuffer(file.download_url)
+                const hashes = extractPakHashes(buf)
+                if (hashes.length === 0) continue
                 db.transaction(() => {
-                    insertContent.run(sha256)
-                    const { changes } = insertFile.run(modId, sha256, file.id, file.version, new Date().toISOString())
-                    if (changes > 0) newFiles++
+                    for (const sha256 of hashes) {
+                        insertContent.run(sha256)
+                        const { changes } = insertFile.run(modId, sha256, file.id, file.version, new Date().toISOString())
+                        if (changes > 0) newFiles++
+                    }
                 })()
                 indexedFileIds.add(file.id)
             } catch (e) {
