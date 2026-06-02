@@ -34,6 +34,7 @@ const API_DELAY_MS = 200
 interface Mod {
     id: number
     name: string
+    version: string
     has_download: boolean
     bumped_at: string
     download: { id: number; version: string; download_url: string; type: string } | null
@@ -342,6 +343,12 @@ async function main(): Promise<void> {
         insertMod.run(sourceId, mod.id, mod.name, modUrl)
         const { id: modId } = getModId.get(sourceId, mod.id) as { id: number }
 
+        if (BACKFILL && mod.version) {
+            // Fix rows that were indexed with a file-level version instead of the mod-level version.
+            db.prepare('UPDATE files SET version = ? WHERE mod_id = ? AND version != ?')
+                .run(mod.version, modId, mod.version)
+        }
+
         for (const file of files) {
             if (!shouldDownload(file.type)) continue
 
@@ -359,7 +366,7 @@ async function main(): Promise<void> {
                 db.transaction(() => {
                     for (const sha256 of hashes) {
                         insertContent.run(sha256)
-                        const { changes } = insertFile.run(modId, sha256, file.id, file.version, new Date().toISOString())
+                        const { changes } = insertFile.run(modId, sha256, file.id, mod.version, new Date().toISOString())
                         if (changes > 0) newFiles++
                     }
                 })()
