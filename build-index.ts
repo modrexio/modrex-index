@@ -14,6 +14,9 @@ import Database, { type Database as DB } from 'better-sqlite3'
 import AdmZip from 'adm-zip'
 import { createHash } from 'crypto'
 import { join } from 'path'
+import { mkdtempSync, rmSync, readdirSync, readFileSync, writeFileSync } from 'fs'
+import { execFileSync } from 'child_process'
+import { tmpdir } from 'os'
 
 const BASE = 'https://api.modworkshop.net'
 const GAME_ID = 853
@@ -208,14 +211,20 @@ async function downloadBuffer(downloadUrl: string): Promise<Buffer> {
     return Buffer.from(await res.arrayBuffer())
 }
 
-// Returns SHA256(s) of all .pak content in buf.
-// If buf is a ZIP archive, extracts each .pak entry and hashes it individually.
-// Otherwise hashes the whole buffer (assumed to be a plain pak).
+function detectFormat(buf: Buffer): 'zip' | '7z' | 'pak' {
+    if (buf.length >= 4 && buf[0] === 0x50 && buf[1] === 0x4b && buf[2] === 0x03 && buf[3] === 0x04)
+        return 'zip'
+    if (buf.length >= 6 && buf[0] === 0x37 && buf[1] === 0x7a && buf[2] === 0xbc &&
+        buf[3] === 0xaf && buf[4] === 0x27 && buf[5] === 0x1c)
+        return '7z'
+    return 'pak'
+}
+
+// Returns SHA256(s) of all .pak content in buf, extracting archives as needed.
 function extractPakHashes(buf: Buffer): string[] {
-    const isZip =
-        buf.length >= 4 &&
-        buf[0] === 0x50 && buf[1] === 0x4b && buf[2] === 0x03 && buf[3] === 0x04
-    if (isZip) {
+    const fmt = detectFormat(buf)
+
+    if (fmt === 'zip') {
         try {
             const zip = new AdmZip(buf)
             return zip
@@ -226,6 +235,23 @@ function extractPakHashes(buf: Buffer): string[] {
             return []
         }
     }
+
+    if (fmt === '7z') {
+        const tmp = mkdtempSync(join(tmpdir(), 'modrex-idx-'))
+        try {
+            const archive = join(tmp, 'archive.7z')
+            writeFileSync(archive, buf)
+            execFileSync('7z', ['e', archive, '-o' + tmp, '*.pak', '-r', '-y'], { stdio: 'ignore' })
+            return readdirSync(tmp)
+                .filter((f) => f.toLowerCase().endsWith('.pak'))
+                .map((f) => createHash('sha256').update(readFileSync(join(tmp, f))).digest('hex'))
+        } catch {
+            return []
+        } finally {
+            rmSync(tmp, { recursive: true, force: true })
+        }
+    }
+
     return [createHash('sha256').update(buf).digest('hex')]
 }
 
@@ -255,6 +281,7 @@ function shouldDownload(type: string): boolean {
     return (
         t.includes('pak') ||
         t.includes('zip') ||
+        t.includes('7z') ||
         t === 'application/octet-stream' ||
         t === 'application/zip' ||
         t === ''
