@@ -22,11 +22,11 @@ const BASE = 'https://api.modworkshop.net'
 const GAME_ID = 853
 const USER_AGENT = 'modrex-indexer/1.0'
 const DB_PATH = join(import.meta.dirname, 'index.db')
-const CONCURRENCY = parseInt(
-    process.argv.find((a) => a.startsWith('--concurrency='))?.split('=')[1] ?? '5'
-)
 // Faster than full_rebuild when adding a new format: only unindexed files are downloaded.
 const BACKFILL = process.argv.includes('--backfill')
+const CONCURRENCY = parseInt(
+    process.argv.find((a) => a.startsWith('--concurrency='))?.split('=')[1] ?? (BACKFILL ? '2' : '5')
+)
 const API_DELAY_MS = 200
 
 // --- types ---
