@@ -25,6 +25,8 @@ const DB_PATH = join(import.meta.dirname, 'index.db')
 const CONCURRENCY = parseInt(
     process.argv.find((a) => a.startsWith('--concurrency='))?.split('=')[1] ?? '5'
 )
+// Faster than full_rebuild when adding a new format: only unindexed files are downloaded.
+const BACKFILL = process.argv.includes('--backfill')
 const API_DELAY_MS = 200
 
 // --- types ---
@@ -300,7 +302,12 @@ async function main(): Promise<void> {
         | { value: string }
         | undefined
     const lastRunAt = lastRunRow ? new Date(lastRunRow.value) : null
-    console.log(lastRunAt ? `  Last run: ${lastRunAt.toISOString()} — incremental update\n` : '  No previous run — full index build\n')
+
+    if (BACKFILL) {
+        console.log('  Backfill mode — scanning all mods, skipping already-indexed files\n')
+    } else {
+        console.log(lastRunAt ? `  Last run: ${lastRunAt.toISOString()} — incremental update\n` : '  No previous run — full index build\n')
+    }
 
     const insertMod = db.prepare(
         'INSERT OR IGNORE INTO mods (source_id, remote_id, name, url) VALUES (?, ?, ?, ?)'
@@ -313,7 +320,7 @@ async function main(): Promise<void> {
 
     const runStartedAt = new Date()
     console.log('Fetching mod list...')
-    const mods = await listModsSince(lastRunAt)
+    const mods = await listModsSince(BACKFILL ? null : lastRunAt)
     console.log(`  ${mods.length} mods to process\n`)
 
     const errors: string[] = []

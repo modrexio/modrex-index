@@ -7,6 +7,10 @@ on:
         description: 'Full rebuild (ignore existing index, re-index all mods)'
         type: boolean
         default: false
+      backfill:
+        description: 'Backfill (scan all mods but skip already-indexed files — use after adding a new format)'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -40,7 +44,9 @@ jobs:
         id: indexer
         run: |
           set +e
-          pnpm build-index
+          args=""
+          ${{ inputs.backfill }} && args="$args --backfill"
+          pnpm build-index $args
           code=$?
           set -e
           if [ $code -eq 1 ]; then exit 1; fi
