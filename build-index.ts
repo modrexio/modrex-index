@@ -93,6 +93,7 @@ CREATE TABLE IF NOT EXISTS files (
     remote_id  INTEGER NOT NULL,
     version    TEXT NOT NULL,
     indexed_at TEXT NOT NULL,
+    entry_name TEXT NOT NULL DEFAULT '',
     UNIQUE(mod_id, sha256)
 );
 
@@ -110,6 +111,13 @@ function openDb(): { db: DB; sourceId: number } {
     const db = new Database(DB_PATH)
     db.exec(SCHEMA)
 
+    // CI builds are incremental over the previous release's db — CREATE TABLE IF
+    // NOT EXISTS won't add columns to it, so migrate explicitly.
+    const fileColumns = db.prepare('PRAGMA table_info(files)').all() as { name: string }[]
+    if (!fileColumns.some((c) => c.name === 'entry_name')) {
+        db.exec("ALTER TABLE files ADD COLUMN entry_name TEXT NOT NULL DEFAULT ''")
+    }
+
     db.prepare('INSERT OR IGNORE INTO games (name, slug) VALUES (?, ?)').run('PAYDAY 3', 'pd3')
     const game = db.prepare('SELECT id FROM games WHERE slug = ?').get('pd3') as { id: number }
 
@@ -125,6 +133,14 @@ function openDb(): { db: DB; sourceId: number } {
 
 function getIndexedFileIds(db: DB): Set<number> {
     const rows = db.prepare('SELECT remote_id FROM files').all() as { remote_id: number }[]
+    return new Set(rows.map((r) => r.remote_id))
+}
+
+// remote_ids indexed before entry_name existed — backfill re-downloads these
+function getFileIdsMissingNames(db: DB): Set<number> {
+    const rows = db
+        .prepare("SELECT DISTINCT remote_id FROM files WHERE entry_name = ''")
+        .all() as { remote_id: number }[]
     return new Set(rows.map((r) => r.remote_id))
 }
 
@@ -223,8 +239,14 @@ function detectFormat(buf: Buffer): 'zip' | '7z' | 'pak' {
     return 'pak'
 }
 
-// Returns SHA256(s) of all .pak content in buf, extracting archives as needed.
-function extractPakHashes(buf: Buffer): string[] {
+interface PakEntry {
+    sha256: string
+    entryName: string
+}
+
+// Returns SHA256 + in-archive path of all .pak content in buf, extracting
+// archives as needed. fallbackName names the buffer itself for bare .pak files.
+function extractPakEntries(buf: Buffer, fallbackName: string): PakEntry[] {
     const fmt = detectFormat(buf)
 
     if (fmt === 'zip') {
@@ -233,7 +255,10 @@ function extractPakHashes(buf: Buffer): string[] {
             return zip
                 .getEntries()
                 .filter((e) => !e.isDirectory && e.entryName.toLowerCase().endsWith('.pak'))
-                .map((e) => createHash('sha256').update(e.getData()).digest('hex'))
+                .map((e) => ({
+                    sha256: createHash('sha256').update(e.getData()).digest('hex'),
+                    entryName: e.entryName.replace(/\\/g, '/'),
+                }))
         } catch {
             return []
         }
@@ -243,11 +268,18 @@ function extractPakHashes(buf: Buffer): string[] {
         const tmp = mkdtempSync(join(tmpdir(), 'modrex-idx-'))
         try {
             const archive = join(tmp, 'archive.7z')
+            const out = join(tmp, 'out')
             writeFileSync(archive, buf)
-            execFileSync('7z', ['e', archive, '-o' + tmp, '*.pak', '-r', '-y'], { stdio: 'ignore' })
-            return readdirSync(tmp)
+            // x (not e) keeps directory structure so entry paths survive
+            execFileSync('7z', ['x', archive, '-o' + out, '*.pak', '-r', '-y'], {
+                stdio: 'ignore',
+            })
+            return (readdirSync(out, { recursive: true }) as string[])
                 .filter((f) => f.toLowerCase().endsWith('.pak'))
-                .map((f) => createHash('sha256').update(readFileSync(join(tmp, f))).digest('hex'))
+                .map((f) => ({
+                    sha256: createHash('sha256').update(readFileSync(join(out, f))).digest('hex'),
+                    entryName: f.replace(/\\/g, '/'),
+                }))
         } catch {
             return []
         } finally {
@@ -255,7 +287,12 @@ function extractPakHashes(buf: Buffer): string[] {
         }
     }
 
-    return [createHash('sha256').update(buf).digest('hex')]
+    return [
+        {
+            sha256: createHash('sha256').update(buf).digest('hex'),
+            entryName: fallbackName,
+        },
+    ]
 }
 
 // --- concurrency pool ---
@@ -297,7 +334,11 @@ async function main(): Promise<void> {
     console.log('Opening database...')
     const { db, sourceId } = openDb()
     const indexedFileIds = getIndexedFileIds(db)
+    const missingNameFileIds = BACKFILL ? getFileIdsMissingNames(db) : new Set<number>()
     console.log(`  ${indexedFileIds.size} files already indexed`)
+    if (BACKFILL && missingNameFileIds.size > 0) {
+        console.log(`  ${missingNameFileIds.size} files missing entry names — will re-download`)
+    }
 
     const lastRunRow = db.prepare('SELECT value FROM metadata WHERE key = ?').get('last_run_at') as
         | { value: string }
@@ -316,7 +357,10 @@ async function main(): Promise<void> {
     const getModId = db.prepare('SELECT id FROM mods WHERE source_id = ? AND remote_id = ?')
     const insertContent = db.prepare('INSERT OR IGNORE INTO file_contents (sha256) VALUES (?)')
     const insertFile = db.prepare(
-        'INSERT OR IGNORE INTO files (mod_id, sha256, remote_id, version, indexed_at) VALUES (?, ?, ?, ?, ?)'
+        'INSERT OR IGNORE INTO files (mod_id, sha256, remote_id, version, indexed_at, entry_name) VALUES (?, ?, ?, ?, ?, ?)'
+    )
+    const fillEntryName = db.prepare(
+        "UPDATE files SET entry_name = ? WHERE mod_id = ? AND sha256 = ? AND entry_name = ''"
     )
 
     const runStartedAt = new Date()
@@ -327,6 +371,7 @@ async function main(): Promise<void> {
     const errors: string[] = []
     let done = 0
     let newFiles = 0
+    let filledNames = 0
 
     const tasks: Task[] = mods.map((mod) => async () => {
         if (!mod.has_download) return
@@ -352,7 +397,7 @@ async function main(): Promise<void> {
         for (const file of files) {
             if (!shouldDownload(file.type)) continue
 
-            if (indexedFileIds.has(file.id)) {
+            if (indexedFileIds.has(file.id) && !missingNameFileIds.has(file.id)) {
                 if (!lastRunAt || new Date(file.updated_at) < new Date(lastRunAt.getTime() - SINCE_BUFFER_MS)) {
                     continue
                 }
@@ -361,16 +406,21 @@ async function main(): Promise<void> {
             try {
                 await delay(API_DELAY_MS)
                 const buf = await downloadBuffer(file.download_url)
-                const hashes = extractPakHashes(buf)
-                if (hashes.length === 0) continue
+                const fallbackName = decodeURIComponent(
+                    new URL(file.download_url).pathname.split('/').pop() ?? ''
+                )
+                const entries = extractPakEntries(buf, fallbackName)
+                if (entries.length === 0) continue
                 db.transaction(() => {
-                    for (const sha256 of hashes) {
+                    for (const { sha256, entryName } of entries) {
                         insertContent.run(sha256)
-                        const { changes } = insertFile.run(modId, sha256, file.id, mod.version, new Date().toISOString())
+                        const { changes } = insertFile.run(modId, sha256, file.id, mod.version, new Date().toISOString(), entryName)
                         if (changes > 0) newFiles++
+                        else if (fillEntryName.run(entryName, modId, sha256).changes > 0) filledNames++
                     }
                 })()
                 indexedFileIds.add(file.id)
+                missingNameFileIds.delete(file.id)
             } catch (e) {
                 errors.push(`mod ${mod.id} file ${file.id}: ${e}`)
             }
@@ -392,7 +442,7 @@ async function main(): Promise<void> {
     )
 
     const total = (db.prepare('SELECT COUNT(*) as n FROM files').get() as { n: number }).n
-    console.log(`\nDone. ${total} files in index.db (${newFiles} new this run)`)
+    console.log(`\nDone. ${total} files in index.db (${newFiles} new, ${filledNames} names filled this run)`)
 
     if (errors.length > 0) {
         console.log(`\n${errors.length} errors:`)
@@ -401,7 +451,7 @@ async function main(): Promise<void> {
 
     db.close()
 
-    if (newFiles === 0) {
+    if (newFiles === 0 && filledNames === 0) {
         console.log('No new files — skipping upload.')
         process.exit(2)
     }
