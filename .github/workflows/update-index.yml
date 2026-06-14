@@ -8,9 +8,13 @@ on:
         type: boolean
         default: false
       backfill:
-        description: 'Backfill (scan all mods but skip already-indexed files — use after adding a new format)'
+        description: 'Backfill (scan all mods but skip already-indexed files — use after adding a new format or a new game)'
         type: boolean
         default: false
+      concurrency:
+        description: 'Download concurrency (default: 5; use 10-20 for the initial backfill)'
+        type: string
+        default: ''
 
 permissions:
   contents: write
@@ -48,7 +52,8 @@ jobs:
         run: |
           set +e
           args=""
-          ${{ inputs.backfill }} && args="$args --backfill"
+          ${{ inputs.backfill == true }} && args="$args --backfill"
+          [ -n "${{ inputs.concurrency }}" ] && args="$args --concurrency=${{ inputs.concurrency }}"
           pnpm build-index $args
           code=$?
           set -e
