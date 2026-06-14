@@ -510,15 +510,19 @@ async function extractPd2FromFull(url: string, type: string): Promise<PakEntry |
 async function extractPd2Entries(url: string, type: string): Promise<PakEntry[]> {
     const fmt = type.toLowerCase()
 
-    if (fmt === 'zip' || fmt === '') {
+    const isRar = fmt === 'rar' || fmt.includes('rar')
+    const is7z = fmt === '7z' || fmt.includes('7z')
+    const isZip = !isRar && !is7z && (fmt === 'zip' || fmt === '' || fmt.includes('zip') || fmt === 'application/octet-stream')
+
+    if (isZip) {
         const entry = await extractPd2FromZip(url)
         return entry ? [entry] : []
     }
 
-    if (fmt === '7z' || fmt === 'rar') {
+    if (isRar || is7z) {
         const size = await headContentLength(url)
         if (size === null || size > PD2_MAX_FULL_DOWNLOAD_BYTES) return []
-        const entry = await extractPd2FromFull(url, fmt)
+        const entry = await extractPd2FromFull(url, isRar ? 'rar' : '7z')
         return entry ? [entry] : []
     }
 
@@ -705,14 +709,17 @@ async function main(): Promise<void> {
     // --- PD2 tasks ---
 
     const pd2Tasks: Task[] = pd2Mods.map((mod) => async () => {
-        // PD2 uses mod.download from the listing — no per-mod /files API call needed.
-        if (!mod.download) {
+        if (!mod.has_download) {
             donePd2++
             return
         }
 
-        const fileId = mod.download.id
-        if (indexedPd2FileIds.has(fileId) && !missingNamePd2FileIds.has(fileId)) {
+        let files: ModFile[] = []
+        try {
+            await delay(API_DELAY_MS)
+            files = await listModFiles(mod.id)
+        } catch (e) {
+            errors.push(`pd2 mod ${mod.id}: failed to list files — ${e}`)
             donePd2++
             return
         }
@@ -721,33 +728,36 @@ async function main(): Promise<void> {
         insertMod.run(pd2SourceId, mod.id, mod.name, modUrl)
         const { id: modId } = getModId.get(pd2SourceId, mod.id) as { id: number }
 
-        try {
-            const entries = await extractPd2Entries(
-                mod.download.download_url,
-                mod.download.type ?? ''
-            )
-            if (entries.length > 0) {
-                db.transaction(() => {
-                    for (const { sha256, entryName } of entries) {
-                        insertContent.run(sha256)
-                        const { changes } = insertFile.run(
-                            modId,
-                            sha256,
-                            fileId,
-                            mod.version,
-                            new Date().toISOString(),
-                            entryName
-                        )
-                        if (changes > 0) newFiles++
-                        else if (fillEntryName.run(entryName, modId, sha256).changes > 0)
-                            filledNames++
-                    }
-                })()
-                indexedPd2FileIds.add(fileId)
-                missingNamePd2FileIds.delete(fileId)
+        for (const file of files) {
+            if (indexedPd2FileIds.has(file.id) && !missingNamePd2FileIds.has(file.id)) {
+                continue
             }
-        } catch (e) {
-            errors.push(`pd2 mod ${mod.id}: ${e}`)
+
+            try {
+                const entries = await extractPd2Entries(file.download_url, file.type ?? '')
+                if (entries.length > 0) {
+                    db.transaction(() => {
+                        for (const { sha256, entryName } of entries) {
+                            insertContent.run(sha256)
+                            const { changes } = insertFile.run(
+                                modId,
+                                sha256,
+                                file.id,
+                                file.version,
+                                new Date().toISOString(),
+                                entryName
+                            )
+                            if (changes > 0) newFiles++
+                            else if (fillEntryName.run(entryName, modId, sha256).changes > 0)
+                                filledNames++
+                        }
+                    })()
+                    indexedPd2FileIds.add(file.id)
+                    missingNamePd2FileIds.delete(file.id)
+                }
+            } catch (e) {
+                errors.push(`pd2 mod ${mod.id} file ${file.id}: ${e}`)
+            }
         }
 
         donePd2++
