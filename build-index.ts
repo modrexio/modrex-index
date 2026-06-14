@@ -174,10 +174,21 @@ async function apiGet<T>(path: string, params?: Record<string, unknown>): Promis
         }
     }
     for (let attempt = 0; attempt < 5; attempt++) {
-        const res = await fetch(url, {
-            headers: { Accept: 'application/json', 'User-Agent': USER_AGENT },
-            signal: AbortSignal.timeout(30_000),
-        })
+        let res: Response
+        try {
+            res = await fetch(url, {
+                headers: { Accept: 'application/json', 'User-Agent': USER_AGENT },
+                signal: AbortSignal.timeout(30_000),
+            })
+        } catch (e) {
+            if (attempt < 4) {
+                const wait = 2_000 * 2 ** attempt
+                console.warn(`  [network error] ${path} — retrying in ${wait}ms`)
+                await delay(wait)
+                continue
+            }
+            throw e
+        }
         if (res.status === 429) {
             const wait = 2_000 * 2 ** attempt
             console.warn(`  [429] ${path} — retrying in ${wait}ms`)
