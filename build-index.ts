@@ -1,25 +1,30 @@
 #!/usr/bin/env npx tsx
 /**
- * Builds the PD3 mod hash index from modworkshop directly into SQLite.
+ * Builds the PD3 + PD2 mod hash index from modworkshop directly into SQLite.
  *
- * Run:   npm run build-index
+ * Run:   pnpm build-index
  * Output: index.db
  *
  * Resumable — already-indexed fileIds are skipped on re-run.
- * Streams each download directly into SHA256 (no temp files).
+ * PD3: streams each download directly into SHA256 (no temp files for .pak extraction).
+ * PD2: uses HTTP Range requests on ZIP archives to fetch only the marker file
+ *      (mod.txt / main.xml / first alphabetical file) without downloading the full archive.
+ *      RAR and 7z archives under 10 MB are fully downloaded and extracted via the 7z CLI.
  * Downloads CONCURRENCY files in parallel to cut total runtime.
  */
 
 import Database, { type Database as DB } from 'better-sqlite3'
 import AdmZip from 'adm-zip'
 import { createHash } from 'crypto'
+import { inflateRawSync } from 'zlib'
 import { join } from 'path'
 import { mkdtempSync, rmSync, readdirSync, readFileSync, writeFileSync } from 'fs'
 import { execFileSync } from 'child_process'
 import { tmpdir } from 'os'
 
 const BASE = 'https://api.modworkshop.net'
-const GAME_ID = 853
+const PD3_GAME_ID = 853
+const PD2_GAME_ID = 1
 const USER_AGENT = 'modrex-indexer/1.0'
 const DB_PATH = join(import.meta.dirname, 'index.db')
 // Faster than full_rebuild when adding a new format: only unindexed files are downloaded.
@@ -28,6 +33,8 @@ const CONCURRENCY = parseInt(
     process.argv.find((a) => a.startsWith('--concurrency='))?.split('=')[1] ?? (BACKFILL ? '2' : '5')
 )
 const API_DELAY_MS = 200
+// RAR and 7z archives larger than this are skipped for PD2 (no efficient marker extraction).
+const PD2_MAX_FULL_DOWNLOAD_BYTES = 10 * 1_024 * 1_024
 
 // --- types ---
 
@@ -107,7 +114,7 @@ CREATE TABLE IF NOT EXISTS metadata (
 
 // --- db setup ---
 
-function openDb(): { db: DB; sourceId: number } {
+function openDb(): { db: DB; pd3SourceId: number; pd2SourceId: number } {
     const db = new Database(DB_PATH)
     db.exec(SCHEMA)
 
@@ -118,29 +125,42 @@ function openDb(): { db: DB; sourceId: number } {
         db.exec("ALTER TABLE files ADD COLUMN entry_name TEXT NOT NULL DEFAULT ''")
     }
 
-    db.prepare('INSERT OR IGNORE INTO games (name, slug) VALUES (?, ?)').run('PAYDAY 3', 'pd3')
-    const game = db.prepare('SELECT id FROM games WHERE slug = ?').get('pd3') as { id: number }
-
-    db.prepare(
+    const upsertGame = db.prepare('INSERT OR IGNORE INTO games (name, slug) VALUES (?, ?)')
+    const getGame = db.prepare('SELECT id FROM games WHERE slug = ?')
+    const upsertSource = db.prepare(
         'INSERT OR IGNORE INTO sources (game_id, name, base_url, game_ref) VALUES (?, ?, ?, ?)'
-    ).run(game.id, 'modworkshop', BASE, String(GAME_ID))
-    const source = db.prepare('SELECT id FROM sources WHERE name = ?').get('modworkshop') as {
-        id: number
-    }
+    )
+    const getSource = db.prepare('SELECT id FROM sources WHERE game_id = ? AND name = ?')
 
-    return { db, sourceId: source.id }
+    upsertGame.run('PAYDAY 3', 'pd3')
+    const pd3Game = getGame.get('pd3') as { id: number }
+    upsertSource.run(pd3Game.id, 'modworkshop', BASE, String(PD3_GAME_ID))
+    const pd3Source = getSource.get(pd3Game.id, 'modworkshop') as { id: number }
+
+    upsertGame.run('PAYDAY 2', 'pd2')
+    const pd2Game = getGame.get('pd2') as { id: number }
+    upsertSource.run(pd2Game.id, 'modworkshop', BASE, String(PD2_GAME_ID))
+    const pd2Source = getSource.get(pd2Game.id, 'modworkshop') as { id: number }
+
+    return { db, pd3SourceId: pd3Source.id, pd2SourceId: pd2Source.id }
 }
 
-function getIndexedFileIds(db: DB): Set<number> {
-    const rows = db.prepare('SELECT remote_id FROM files').all() as { remote_id: number }[]
+// Scope indexed file IDs to a specific source so PD2 and PD3 remote_ids never collide.
+function getIndexedFileIds(db: DB, sourceId: number): Set<number> {
+    const rows = db
+        .prepare(
+            'SELECT f.remote_id FROM files f JOIN mods m ON m.id = f.mod_id WHERE m.source_id = ?'
+        )
+        .all(sourceId) as { remote_id: number }[]
     return new Set(rows.map((r) => r.remote_id))
 }
 
-// remote_ids indexed before entry_name existed — backfill re-downloads these
-function getFileIdsMissingNames(db: DB): Set<number> {
+function getFileIdsMissingNames(db: DB, sourceId: number): Set<number> {
     const rows = db
-        .prepare("SELECT DISTINCT remote_id FROM files WHERE entry_name = ''")
-        .all() as { remote_id: number }[]
+        .prepare(
+            "SELECT DISTINCT f.remote_id FROM files f JOIN mods m ON m.id = f.mod_id WHERE m.source_id = ? AND f.entry_name = ''"
+        )
+        .all(sourceId) as { remote_id: number }[]
     return new Set(rows.map((r) => r.remote_id))
 }
 
@@ -173,13 +193,13 @@ async function apiGet<T>(path: string, params?: Record<string, unknown>): Promis
 // 10-minute overlap so mods bumped during the previous run aren't missed
 const SINCE_BUFFER_MS = 10 * 60 * 1000
 
-async function listModsSince(since: Date | null): Promise<Mod[]> {
+async function listModsSince(gameId: number, since: Date | null): Promise<Mod[]> {
     const threshold = since ? new Date(since.getTime() - SINCE_BUFFER_MS) : null
     const mods: Mod[] = []
     let page = 1
     let lastPage = 1
     do {
-        const result = await apiGet<Paginated<Mod>>(`/games/${GAME_ID}/mods`, {
+        const result = await apiGet<Paginated<Mod>>(`/games/${gameId}/mods`, {
             limit: 50,
             page,
             sort: 'bumped_at',
@@ -212,14 +232,14 @@ async function listModFiles(modId: number): Promise<ModFile[]> {
         })
         lastPage = result.meta.last_page
         files.push(...result.data)
-        
+
         page++
         if (page <= lastPage) await delay(API_DELAY_MS)
     } while (page <= lastPage)
     return files
 }
 
-// --- download + extraction ---
+// --- PD3 download + extraction ---
 
 async function downloadBuffer(downloadUrl: string): Promise<Buffer> {
     const res = await fetch(downloadUrl, {
@@ -233,8 +253,15 @@ async function downloadBuffer(downloadUrl: string): Promise<Buffer> {
 function detectFormat(buf: Buffer): 'zip' | '7z' | 'pak' {
     if (buf.length >= 4 && buf[0] === 0x50 && buf[1] === 0x4b && buf[2] === 0x03 && buf[3] === 0x04)
         return 'zip'
-    if (buf.length >= 6 && buf[0] === 0x37 && buf[1] === 0x7a && buf[2] === 0xbc &&
-        buf[3] === 0xaf && buf[4] === 0x27 && buf[5] === 0x1c)
+    if (
+        buf.length >= 6 &&
+        buf[0] === 0x37 &&
+        buf[1] === 0x7a &&
+        buf[2] === 0xbc &&
+        buf[3] === 0xaf &&
+        buf[4] === 0x27 &&
+        buf[5] === 0x1c
+    )
         return '7z'
     return 'pak'
 }
@@ -295,6 +322,209 @@ function extractPakEntries(buf: Buffer, fallbackName: string): PakEntry[] {
     ]
 }
 
+// --- PD2 ZIP Range extraction ---
+
+interface CdEntry {
+    name: string
+    localOffset: number
+    compressedSize: number
+    compressionMethod: number
+}
+
+async function headContentLength(url: string): Promise<number | null> {
+    const res = await fetch(url, {
+        method: 'HEAD',
+        headers: { 'User-Agent': USER_AGENT },
+        signal: AbortSignal.timeout(30_000),
+        redirect: 'follow',
+    })
+    if (!res.ok) return null
+    const len = res.headers.get('content-length')
+    const n = len ? parseInt(len, 10) : 0
+    return n > 0 ? n : null
+}
+
+async function rangeGet(url: string, start: number, end: number): Promise<Buffer> {
+    const res = await fetch(url, {
+        headers: { 'User-Agent': USER_AGENT, Range: `bytes=${start}-${end}` },
+        signal: AbortSignal.timeout(60_000),
+        redirect: 'follow',
+    })
+    // 200 means the server ignored Range and returned everything (still usable)
+    if (res.status !== 206 && res.status !== 200) throw new Error(`rangeGet ${res.status}`)
+    return Buffer.from(await res.arrayBuffer())
+}
+
+function findEocd(buf: Buffer): { cdOffset: number; cdSize: number } | null {
+    for (let i = buf.length - 22; i >= 0; i--) {
+        if (
+            buf[i] === 0x50 &&
+            buf[i + 1] === 0x4b &&
+            buf[i + 2] === 0x05 &&
+            buf[i + 3] === 0x06
+        ) {
+            const cdSize = buf.readUInt32LE(i + 12)
+            const cdOffset = buf.readUInt32LE(i + 16)
+            // 0xFFFFFFFF means ZIP64 — we don't support that
+            if (cdOffset === 0xffffffff || cdSize === 0xffffffff) return null
+            return { cdOffset, cdSize }
+        }
+    }
+    return null
+}
+
+function parseCd(cd: Buffer): CdEntry[] {
+    const entries: CdEntry[] = []
+    let pos = 0
+    while (pos + 46 <= cd.length) {
+        if (cd.readUInt32LE(pos) !== 0x02014b50) break
+        const compressionMethod = cd.readUInt16LE(pos + 10)
+        const compressedSize = cd.readUInt32LE(pos + 20)
+        const fnLen = cd.readUInt16LE(pos + 28)
+        const exLen = cd.readUInt16LE(pos + 30)
+        const cmtLen = cd.readUInt16LE(pos + 32)
+        const localOffset = cd.readUInt32LE(pos + 42)
+        const name = cd.slice(pos + 46, pos + 46 + fnLen).toString('utf8')
+        entries.push({ name, localOffset, compressedSize, compressionMethod })
+        pos += 46 + fnLen + exLen + cmtLen
+    }
+    return entries
+}
+
+function selectMarkerPath(paths: string[]): string | null {
+    const files = paths.filter((p) => !p.endsWith('/'))
+    if (files.length === 0) return null
+
+    const depth = (p: string) => p.split('/').length - 1
+
+    const modTxt = files.find((p) => {
+        const l = p.toLowerCase()
+        return (l === 'mod.txt' || l.endsWith('/mod.txt')) && depth(p) <= 1
+    })
+    if (modTxt) return modTxt
+
+    const mainXml = files.find((p) => {
+        const l = p.toLowerCase()
+        return (l === 'main.xml' || l.endsWith('/main.xml')) && depth(p) <= 1
+    })
+    if (mainXml) return mainXml
+
+    // single top-level folder means wrapper — sort relative to it to match first_file_in_dir
+    const sorted = [...files].sort((a, b) => a.localeCompare(b))
+    const roots = [...new Set(files.map((p) => p.split('/')[0]))]
+    if (roots.length === 1 && roots[0] !== '') {
+        const prefix = roots[0] + '/'
+        const rel = sorted
+            .filter((p) => p.startsWith(prefix))
+            .map((p) => ({ path: p, rel: p.slice(prefix.length) }))
+            .sort((a, b) => a.rel.localeCompare(b.rel))
+        return rel[0]?.path ?? null
+    }
+
+    return sorted[0] ?? null
+}
+
+// Typically fetches only ~100 KB regardless of archive size.
+async function extractPd2FromZip(url: string): Promise<PakEntry | null> {
+    const size = await headContentLength(url)
+    if (!size || size < 22) return null
+
+    // EOCD is within the last 65535 + 22 bytes (max ZIP comment size + EOCD fixed size)
+    const tailStart = Math.max(0, size - 65_557)
+    const tail = await rangeGet(url, tailStart, size - 1)
+
+    const eocd = findEocd(tail)
+    if (!eocd) return null
+
+    const { cdOffset, cdSize } = eocd
+    const cd = await rangeGet(url, cdOffset, cdOffset + cdSize - 1)
+    const entries = parseCd(cd)
+
+    const chosen = selectMarkerPath(entries.map((e) => e.name))
+    const marker = chosen ? (entries.find((e) => e.name === chosen) ?? null) : null
+    if (!marker) return null
+
+    // Files stored with a data descriptor (bit 3 of flags) may report compressedSize=0
+    // in the Central Directory; we can't range those without reading the data descriptor.
+    if (marker.compressedSize === 0) return null
+
+    const localHeader = await rangeGet(url, marker.localOffset, marker.localOffset + 29)
+    if (localHeader.readUInt32LE(0) !== 0x04034b50) return null
+    const lfnLen = localHeader.readUInt16LE(26)
+    const lexLen = localHeader.readUInt16LE(28)
+    const dataStart = marker.localOffset + 30 + lfnLen + lexLen
+
+    const compressed = await rangeGet(url, dataStart, dataStart + marker.compressedSize - 1)
+
+    let content: Buffer
+    if (marker.compressionMethod === 0) {
+        content = compressed
+    } else if (marker.compressionMethod === 8) {
+        try {
+            content = inflateRawSync(compressed)
+        } catch {
+            return null
+        }
+    } else {
+        return null
+    }
+
+    return {
+        sha256: createHash('sha256').update(content).digest('hex'),
+        entryName: marker.name,
+    }
+}
+
+// p7zip-full required for RAR support on Ubuntu CI runners.
+async function extractPd2FromFull(url: string, type: string): Promise<PakEntry | null> {
+    const buf = await downloadBuffer(url)
+    const ext = type === 'rar' ? '.rar' : '.7z'
+    const tmp = mkdtempSync(join(tmpdir(), 'modrex-pd2-'))
+    try {
+        const archive = join(tmp, 'archive' + ext)
+        const outDir = join(tmp, 'out')
+        writeFileSync(archive, buf)
+        try {
+            execFileSync('7z', ['x', archive, '-o' + outDir, '-y'], { stdio: 'ignore' })
+        } catch {
+            return null
+        }
+
+        const allFiles = (readdirSync(outDir, { recursive: true }) as string[])
+            .map((f) => f.replace(/\\/g, '/'))
+            .filter((f) => !f.endsWith('/'))
+
+        const chosen = selectMarkerPath(allFiles)
+        if (!chosen) return null
+
+        const content = readFileSync(join(outDir, chosen))
+        return {
+            sha256: createHash('sha256').update(content).digest('hex'),
+            entryName: chosen,
+        }
+    } finally {
+        rmSync(tmp, { recursive: true, force: true })
+    }
+}
+
+async function extractPd2Entries(url: string, type: string): Promise<PakEntry[]> {
+    const fmt = type.toLowerCase()
+
+    if (fmt === 'zip' || fmt === '') {
+        const entry = await extractPd2FromZip(url)
+        return entry ? [entry] : []
+    }
+
+    if (fmt === '7z' || fmt === 'rar') {
+        const size = await headContentLength(url)
+        if (size === null || size > PD2_MAX_FULL_DOWNLOAD_BYTES) return []
+        const entry = await extractPd2FromFull(url, fmt)
+        return entry ? [entry] : []
+    }
+
+    return []
+}
+
 // --- concurrency pool ---
 
 type Task = () => Promise<void>
@@ -332,12 +562,18 @@ function shouldDownload(type: string): boolean {
 
 async function main(): Promise<void> {
     console.log('Opening database...')
-    const { db, sourceId } = openDb()
-    const indexedFileIds = getIndexedFileIds(db)
-    const missingNameFileIds = BACKFILL ? getFileIdsMissingNames(db) : new Set<number>()
-    console.log(`  ${indexedFileIds.size} files already indexed`)
-    if (BACKFILL && missingNameFileIds.size > 0) {
-        console.log(`  ${missingNameFileIds.size} files missing entry names — will re-download`)
+    const { db, pd3SourceId, pd2SourceId } = openDb()
+    const indexedPd3FileIds = getIndexedFileIds(db, pd3SourceId)
+    const indexedPd2FileIds = getIndexedFileIds(db, pd2SourceId)
+    const missingNamePd3FileIds = BACKFILL ? getFileIdsMissingNames(db, pd3SourceId) : new Set<number>()
+    const missingNamePd2FileIds = BACKFILL ? getFileIdsMissingNames(db, pd2SourceId) : new Set<number>()
+    console.log(
+        `  ${indexedPd3FileIds.size} PD3 files + ${indexedPd2FileIds.size} PD2 files already indexed`
+    )
+    if (BACKFILL && (missingNamePd3FileIds.size > 0 || missingNamePd2FileIds.size > 0)) {
+        console.log(
+            `  ${missingNamePd3FileIds.size} PD3 + ${missingNamePd2FileIds.size} PD2 files missing entry names — will re-download`
+        )
     }
 
     const lastRunRow = db.prepare('SELECT value FROM metadata WHERE key = ?').get('last_run_at') as
@@ -348,7 +584,11 @@ async function main(): Promise<void> {
     if (BACKFILL) {
         console.log('  Backfill mode — scanning all mods, skipping already-indexed files\n')
     } else {
-        console.log(lastRunAt ? `  Last run: ${lastRunAt.toISOString()} — incremental update\n` : '  No previous run — full index build\n')
+        console.log(
+            lastRunAt
+                ? `  Last run: ${lastRunAt.toISOString()} — incremental update\n`
+                : '  No previous run — full index build\n'
+        )
     }
 
     const insertMod = db.prepare(
@@ -364,43 +604,62 @@ async function main(): Promise<void> {
     )
 
     const runStartedAt = new Date()
-    console.log('Fetching mod list...')
-    const mods = await listModsSince(BACKFILL ? null : lastRunAt)
-    console.log(`  ${mods.length} mods to process\n`)
-
     const errors: string[] = []
-    let done = 0
     let newFiles = 0
     let filledNames = 0
 
-    const tasks: Task[] = mods.map((mod) => async () => {
-        if (!mod.has_download) return
+    // Fetch both mod lists before building tasks so closures can reference both lengths.
+    console.log('Fetching PD3 mod list...')
+    const pd3Mods = await listModsSince(PD3_GAME_ID, BACKFILL ? null : lastRunAt)
+    console.log(`  ${pd3Mods.length} PD3 mods to process\n`)
+
+    console.log('Fetching PD2 mod list...')
+    const pd2Mods = await listModsSince(PD2_GAME_ID, BACKFILL ? null : lastRunAt)
+    console.log(`  ${pd2Mods.length} PD2 mods to process\n`)
+
+    let donePd3 = 0
+    let donePd2 = 0
+
+    // --- PD3 tasks ---
+
+    const pd3Tasks: Task[] = pd3Mods.map((mod) => async () => {
+        if (!mod.has_download) {
+            donePd3++
+            return
+        }
         let files: ModFile[] = []
         try {
             await delay(API_DELAY_MS)
             files = await listModFiles(mod.id)
         } catch (e) {
-            errors.push(`mod ${mod.id}: failed to list files — ${e}`)
+            errors.push(`pd3 mod ${mod.id}: failed to list files — ${e}`)
+            donePd3++
             return
         }
 
         const modUrl = `https://modworkshop.net/mod/${mod.id}`
-        insertMod.run(sourceId, mod.id, mod.name, modUrl)
-        const { id: modId } = getModId.get(sourceId, mod.id) as { id: number }
+        insertMod.run(pd3SourceId, mod.id, mod.name, modUrl)
+        const { id: modId } = getModId.get(pd3SourceId, mod.id) as { id: number }
 
         if (BACKFILL && mod.version) {
-            // Fix rows that were indexed with a file-level version instead of the mod-level version.
-            db.prepare('UPDATE files SET version = ? WHERE mod_id = ? AND version != ?')
-                .run(mod.version, modId, mod.version)
+            db.prepare('UPDATE files SET version = ? WHERE mod_id = ? AND version != ?').run(
+                mod.version,
+                modId,
+                mod.version
+            )
         }
 
         for (const file of files) {
             if (!shouldDownload(file.type)) continue
 
-            if (indexedFileIds.has(file.id) && !missingNameFileIds.has(file.id)) {
-                if (!lastRunAt || new Date(file.updated_at) < new Date(lastRunAt.getTime() - SINCE_BUFFER_MS)) {
-                    continue
-                }
+            if (
+                indexedPd3FileIds.has(file.id) &&
+                !missingNamePd3FileIds.has(file.id) &&
+                (!lastRunAt ||
+                    new Date(file.updated_at) <
+                        new Date(lastRunAt.getTime() - SINCE_BUFFER_MS))
+            ) {
+                continue
             }
 
             try {
@@ -414,27 +673,96 @@ async function main(): Promise<void> {
                 db.transaction(() => {
                     for (const { sha256, entryName } of entries) {
                         insertContent.run(sha256)
-                        const { changes } = insertFile.run(modId, sha256, file.id, mod.version, new Date().toISOString(), entryName)
+                        const { changes } = insertFile.run(
+                            modId,
+                            sha256,
+                            file.id,
+                            mod.version,
+                            new Date().toISOString(),
+                            entryName
+                        )
                         if (changes > 0) newFiles++
-                        else if (fillEntryName.run(entryName, modId, sha256).changes > 0) filledNames++
+                        else if (fillEntryName.run(entryName, modId, sha256).changes > 0)
+                            filledNames++
                     }
                 })()
-                indexedFileIds.add(file.id)
-                missingNameFileIds.delete(file.id)
+                indexedPd3FileIds.add(file.id)
+                missingNamePd3FileIds.delete(file.id)
             } catch (e) {
-                errors.push(`mod ${mod.id} file ${file.id}: ${e}`)
+                errors.push(`pd3 mod ${mod.id} file ${file.id}: ${e}`)
             }
         }
 
-        done++
-        if (done % 50 === 0) {
+        donePd3++
+        if (donePd3 % 50 === 0) {
             const total = (db.prepare('SELECT COUNT(*) as n FROM files').get() as { n: number }).n
-            console.log(`  [${done}/${mods.length} mods processed — ${total} files indexed]`)
+            console.log(
+                `  [PD3: ${donePd3}/${pd3Mods.length} — PD2: ${donePd2}/${pd2Mods.length} — ${total} files indexed]`
+            )
         }
     })
 
-    console.log(`Processing ${mods.length} mods with ${CONCURRENCY} concurrent workers...\n`)
-    await runPool(tasks, CONCURRENCY)
+    // --- PD2 tasks ---
+
+    const pd2Tasks: Task[] = pd2Mods.map((mod) => async () => {
+        // PD2 uses mod.download from the listing — no per-mod /files API call needed.
+        if (!mod.download) {
+            donePd2++
+            return
+        }
+
+        const fileId = mod.download.id
+        if (indexedPd2FileIds.has(fileId) && !missingNamePd2FileIds.has(fileId)) {
+            donePd2++
+            return
+        }
+
+        const modUrl = `https://modworkshop.net/mod/${mod.id}`
+        insertMod.run(pd2SourceId, mod.id, mod.name, modUrl)
+        const { id: modId } = getModId.get(pd2SourceId, mod.id) as { id: number }
+
+        try {
+            const entries = await extractPd2Entries(
+                mod.download.download_url,
+                mod.download.type ?? ''
+            )
+            if (entries.length > 0) {
+                db.transaction(() => {
+                    for (const { sha256, entryName } of entries) {
+                        insertContent.run(sha256)
+                        const { changes } = insertFile.run(
+                            modId,
+                            sha256,
+                            fileId,
+                            mod.version,
+                            new Date().toISOString(),
+                            entryName
+                        )
+                        if (changes > 0) newFiles++
+                        else if (fillEntryName.run(entryName, modId, sha256).changes > 0)
+                            filledNames++
+                    }
+                })()
+                indexedPd2FileIds.add(fileId)
+                missingNamePd2FileIds.delete(fileId)
+            }
+        } catch (e) {
+            errors.push(`pd2 mod ${mod.id}: ${e}`)
+        }
+
+        donePd2++
+        if (donePd2 % 200 === 0) {
+            const total = (db.prepare('SELECT COUNT(*) as n FROM files').get() as { n: number }).n
+            console.log(
+                `  [PD3: ${donePd3}/${pd3Mods.length} — PD2: ${donePd2}/${pd2Mods.length} — ${total} files indexed]`
+            )
+        }
+    })
+
+    console.log(
+        `Processing ${pd3Mods.length} PD3 + ${pd2Mods.length} PD2 mods with ${CONCURRENCY} workers...\n`
+    )
+    await runPool([...pd3Tasks, ...pd2Tasks], CONCURRENCY)
 
     db.prepare('INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)').run(
         'last_run_at',
@@ -442,7 +770,9 @@ async function main(): Promise<void> {
     )
 
     const total = (db.prepare('SELECT COUNT(*) as n FROM files').get() as { n: number }).n
-    console.log(`\nDone. ${total} files in index.db (${newFiles} new, ${filledNames} names filled this run)`)
+    console.log(
+        `\nDone. ${total} files in index.db (${newFiles} new, ${filledNames} names filled this run)`
+    )
 
     if (errors.length > 0) {
         console.log(`\n${errors.length} errors:`)

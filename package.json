@@ -11,6 +11,7 @@
         "@types/node": "^25.9.0",
         "adm-zip": "^0.5.16",
         "better-sqlite3": "^11.9.1",
-        "tsx": "^4.22.1"
+        "tsx": "^4.22.1",
+        "typescript": "^6.0.3"
     }
 }

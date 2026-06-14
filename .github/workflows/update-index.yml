@@ -31,6 +31,9 @@ jobs:
           node-version: 22
           cache: pnpm
 
+      - name: Install system dependencies
+        run: sudo apt-get install -y p7zip-full
+
       - name: Install dependencies
         run: pnpm install
 
@@ -60,4 +63,4 @@ jobs:
           gh release upload latest-index index.db --clobber 2>/dev/null || \
             gh release create latest-index index.db \
               --title "Latest mod index" \
-              --notes "Auto-updated PD3 mod hash index for modrex."
+              --notes "Auto-updated PD2 + PD3 mod hash index for modrex."
