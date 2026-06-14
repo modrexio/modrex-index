@@ -18,7 +18,7 @@ import AdmZip from 'adm-zip'
 import { createHash } from 'crypto'
 import { inflateRawSync } from 'zlib'
 import { join } from 'path'
-import { mkdtempSync, rmSync, readdirSync, readFileSync, writeFileSync } from 'fs'
+import { mkdtempSync, rmSync, readdirSync, readFileSync, statSync, writeFileSync } from 'fs'
 import { execFileSync } from 'child_process'
 import { tmpdir } from 'os'
 
@@ -516,9 +516,17 @@ async function extractPd2FromFull(url: string, type: string): Promise<PakEntry |
             return null
         }
 
+        // readdirSync(recursive) lists directories too, and they carry no trailing
+        // slash — stat each so selectMarkerPath never picks a dir (readFileSync EISDIR).
         const allFiles = (readdirSync(outDir, { recursive: true }) as string[])
+            .filter((f) => {
+                try {
+                    return statSync(join(outDir, f)).isFile()
+                } catch {
+                    return false
+                }
+            })
             .map((f) => f.replace(/\\/g, '/'))
-            .filter((f) => !f.endsWith('/'))
 
         const chosen = selectMarkerPath(allFiles)
         if (!chosen) return null
