@@ -30,9 +30,14 @@ const DB_PATH = join(import.meta.dirname, 'index.db')
 // Faster than full_rebuild when adding a new format: only unindexed files are downloaded.
 const BACKFILL = process.argv.includes('--backfill')
 const CONCURRENCY = parseInt(
-    process.argv.find((a) => a.startsWith('--concurrency='))?.split('=')[1] ?? (BACKFILL ? '2' : '5')
+    process.argv.find((a) => a.startsWith('--concurrency='))?.split('=')[1] ?? (BACKFILL ? '10' : '5')
 )
-const API_DELAY_MS = 200
+// modworkshop meters api.modworkshop.net at 90 req/min per IP (x-ratelimit-limit header).
+// We reserve one slot every ~706 ms (~85/min) so all workers share a single safe pace and
+// never trip a 429. storage.modworkshop.net is unmetered and bypasses this throttle.
+const API_RATE_PER_MIN = 85
+const API_MIN_INTERVAL_MS = Math.ceil(60_000 / API_RATE_PER_MIN)
+let apiNextSlot = 0
 // RAR and 7z archives larger than this are skipped for PD2 (no efficient marker extraction).
 const PD2_MAX_FULL_DOWNLOAD_BYTES = 10 * 1_024 * 1_024
 
@@ -44,7 +49,10 @@ interface Mod {
     version: string
     has_download: boolean
     bumped_at: string
-    download: { id: number; version: string; download_url: string; type: string } | null
+    // The listing carries the primary download inline — no per-mod /files call needed.
+    // download_type is 'file' (hosted), 'link' (external), or null (none).
+    download_id: number | null
+    download_type: string | null
 }
 
 interface ModFile {
@@ -166,6 +174,14 @@ function getFileIdsMissingNames(db: DB, sourceId: number): Set<number> {
 
 // --- API ---
 
+// Reserve the next api.modworkshop.net slot, spacing calls to stay under the 90/min cap.
+async function apiThrottle(): Promise<void> {
+    const now = Date.now()
+    const slot = Math.max(now, apiNextSlot)
+    apiNextSlot = slot + API_MIN_INTERVAL_MS
+    if (slot > now) await delay(slot - now)
+}
+
 async function apiGet<T>(path: string, params?: Record<string, unknown>): Promise<T> {
     const url = new URL(`${BASE}${path}`)
     if (params) {
@@ -174,6 +190,7 @@ async function apiGet<T>(path: string, params?: Record<string, unknown>): Promis
         }
     }
     for (let attempt = 0; attempt < 5; attempt++) {
+        await apiThrottle()
         let res: Response
         try {
             res = await fetch(url, {
@@ -227,7 +244,6 @@ async function listModsSince(gameId: number, since: Date | null): Promise<Mod[]>
 
         console.log(`  page ${page}/${lastPage} (${mods.length} mods)`)
         page++
-        if (page <= lastPage) await delay(API_DELAY_MS)
     } while (page <= lastPage)
     return mods
 }
@@ -245,7 +261,6 @@ async function listModFiles(modId: number): Promise<ModFile[]> {
         files.push(...result.data)
 
         page++
-        if (page <= lastPage) await delay(API_DELAY_MS)
     } while (page <= lastPage)
     return files
 }
@@ -436,8 +451,8 @@ function selectMarkerPath(paths: string[]): string | null {
 }
 
 // Typically fetches only ~100 KB regardless of archive size.
-async function extractPd2FromZip(url: string): Promise<PakEntry | null> {
-    const size = await headContentLength(url)
+async function extractPd2FromZip(url: string, knownSize: number | null): Promise<PakEntry | null> {
+    const size = knownSize ?? (await headContentLength(url))
     if (!size || size < 22) return null
 
     // EOCD is within the last 65535 + 22 bytes (max ZIP comment size + EOCD fixed size)
@@ -518,26 +533,39 @@ async function extractPd2FromFull(url: string, type: string): Promise<PakEntry |
     }
 }
 
-async function extractPd2Entries(url: string, type: string): Promise<PakEntry[]> {
-    const fmt = type.toLowerCase()
+// Resolves a listing download_id to its CDN URL (+ size) with a single throttled api
+// hit; the 302 follows through to unmetered storage.modworkshop.net for the actual bytes.
+async function resolveDownload(
+    downloadId: number
+): Promise<{ url: string; size: number | null } | null> {
+    await apiThrottle()
+    const res = await fetch(`${BASE}/files/${downloadId}/download`, {
+        method: 'HEAD',
+        headers: { 'User-Agent': USER_AGENT },
+        signal: AbortSignal.timeout(30_000),
+        redirect: 'follow',
+    })
+    if (!res.ok) return null
+    const len = res.headers.get('content-length')
+    const size = len ? parseInt(len, 10) : 0
+    // res.url is the final storage URL after the redirect.
+    return { url: res.url, size: size > 0 ? size : null }
+}
 
-    const isRar = fmt === 'rar' || fmt.includes('rar')
-    const is7z = fmt === '7z' || fmt.includes('7z')
-    const isZip = !isRar && !is7z && (fmt === 'zip' || fmt === '' || fmt.includes('zip') || fmt === 'application/octet-stream')
+// url is a resolved storage.modworkshop.net URL; archive format comes from its extension.
+async function extractPd2Entries(url: string, size: number | null): Promise<PakEntry[]> {
+    const path = url.split('?')[0].toLowerCase()
 
-    if (isZip) {
-        const entry = await extractPd2FromZip(url)
+    if (path.endsWith('.rar') || path.endsWith('.7z')) {
+        const sz = size ?? (await headContentLength(url))
+        if (sz === null || sz > PD2_MAX_FULL_DOWNLOAD_BYTES) return []
+        const entry = await extractPd2FromFull(url, path.endsWith('.rar') ? 'rar' : '7z')
         return entry ? [entry] : []
     }
 
-    if (isRar || is7z) {
-        const size = await headContentLength(url)
-        if (size === null || size > PD2_MAX_FULL_DOWNLOAD_BYTES) return []
-        const entry = await extractPd2FromFull(url, isRar ? 'rar' : '7z')
-        return entry ? [entry] : []
-    }
-
-    return []
+    // zip — also the fallback for unknown extensions (findEocd returns null on non-zip)
+    const entry = await extractPd2FromZip(url, size)
+    return entry ? [entry] : []
 }
 
 // --- concurrency pool ---
@@ -644,7 +672,6 @@ async function main(): Promise<void> {
         }
         let files: ModFile[] = []
         try {
-            await delay(API_DELAY_MS)
             files = await listModFiles(mod.id)
         } catch (e) {
             errors.push(`pd3 mod ${mod.id}: failed to list files — ${e}`)
@@ -678,7 +705,6 @@ async function main(): Promise<void> {
             }
 
             try {
-                await delay(API_DELAY_MS)
                 const buf = await downloadBuffer(file.download_url)
                 const fallbackName = decodeURIComponent(
                     new URL(file.download_url).pathname.split('/').pop() ?? ''
@@ -720,17 +746,28 @@ async function main(): Promise<void> {
     // --- PD2 tasks ---
 
     const pd2Tasks: Task[] = pd2Mods.map((mod) => async () => {
-        if (!mod.has_download) {
+        // Only 'file' downloads are hosted archives; 'link'/null are external — skip, no call.
+        if (mod.download_type !== 'file' || mod.download_id == null) {
             donePd2++
             return
         }
 
-        let files: ModFile[] = []
+        // download_id is the file's remote_id — already-indexed files cost zero API calls.
+        const fileId = mod.download_id
+        if (indexedPd2FileIds.has(fileId) && !missingNamePd2FileIds.has(fileId)) {
+            donePd2++
+            return
+        }
+
+        let resolved: { url: string; size: number | null } | null
         try {
-            await delay(API_DELAY_MS)
-            files = await listModFiles(mod.id)
+            resolved = await resolveDownload(fileId)
         } catch (e) {
-            errors.push(`pd2 mod ${mod.id}: failed to list files — ${e}`)
+            errors.push(`pd2 mod ${mod.id}: failed to resolve download — ${e}`)
+            donePd2++
+            return
+        }
+        if (!resolved) {
             donePd2++
             return
         }
@@ -739,36 +776,30 @@ async function main(): Promise<void> {
         insertMod.run(pd2SourceId, mod.id, mod.name, modUrl)
         const { id: modId } = getModId.get(pd2SourceId, mod.id) as { id: number }
 
-        for (const file of files) {
-            if (indexedPd2FileIds.has(file.id) && !missingNamePd2FileIds.has(file.id)) {
-                continue
+        try {
+            const entries = await extractPd2Entries(resolved.url, resolved.size)
+            if (entries.length > 0) {
+                db.transaction(() => {
+                    for (const { sha256, entryName } of entries) {
+                        insertContent.run(sha256)
+                        const { changes } = insertFile.run(
+                            modId,
+                            sha256,
+                            fileId,
+                            mod.version,
+                            new Date().toISOString(),
+                            entryName
+                        )
+                        if (changes > 0) newFiles++
+                        else if (fillEntryName.run(entryName, modId, sha256).changes > 0)
+                            filledNames++
+                    }
+                })()
+                indexedPd2FileIds.add(fileId)
+                missingNamePd2FileIds.delete(fileId)
             }
-
-            try {
-                const entries = await extractPd2Entries(file.download_url, file.type ?? '')
-                if (entries.length > 0) {
-                    db.transaction(() => {
-                        for (const { sha256, entryName } of entries) {
-                            insertContent.run(sha256)
-                            const { changes } = insertFile.run(
-                                modId,
-                                sha256,
-                                file.id,
-                                file.version,
-                                new Date().toISOString(),
-                                entryName
-                            )
-                            if (changes > 0) newFiles++
-                            else if (fillEntryName.run(entryName, modId, sha256).changes > 0)
-                                filledNames++
-                        }
-                    })()
-                    indexedPd2FileIds.add(file.id)
-                    missingNamePd2FileIds.delete(file.id)
-                }
-            } catch (e) {
-                errors.push(`pd2 mod ${mod.id} file ${file.id}: ${e}`)
-            }
+        } catch (e) {
+            errors.push(`pd2 mod ${mod.id} file ${fileId}: ${e}`)
         }
 
         donePd2++

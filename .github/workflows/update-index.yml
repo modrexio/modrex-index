@@ -12,12 +12,19 @@ on:
         type: boolean
         default: false
       concurrency:
-        description: 'Download concurrency (default: 5; use 10-20 for the initial backfill)'
+        description: 'Storage download parallelism (default 5, backfill 10; API calls are throttled separately so higher is safe)'
         type: string
         default: ''
 
 permissions:
   contents: write
+
+# One run at a time: the indexer shares a 90 req/min API budget per IP. Overlapping
+# runs (e.g. the 5-minute cron firing during a long backfill) would split that budget
+# and trigger 429s. New runs queue instead of cancelling the in-progress one.
+concurrency:
+  group: update-index
+  cancel-in-progress: false
 
 jobs:
   update:
