@@ -172,6 +172,17 @@ function getFileIdsMissingNames(db: DB, sourceId: number): Set<number> {
     return new Set(rows.map((r) => r.remote_id))
 }
 
+// Remote mod IDs that already have at least one indexed file. Used to skip the
+// /files fallback for mods whose listing carries no download_id on re-runs.
+function getIndexedModIds(db: DB, sourceId: number): Set<number> {
+    const rows = db
+        .prepare(
+            'SELECT DISTINCT m.remote_id FROM mods m JOIN files f ON f.mod_id = m.id WHERE m.source_id = ?'
+        )
+        .all(sourceId) as { remote_id: number }[]
+    return new Set(rows.map((r) => r.remote_id))
+}
+
 // --- API ---
 
 // Reserve the next api.modworkshop.net slot, spacing calls to stay under the 90/min cap.
@@ -616,6 +627,7 @@ async function main(): Promise<void> {
     const { db, pd3SourceId, pd2SourceId } = openDb()
     const indexedPd3FileIds = getIndexedFileIds(db, pd3SourceId)
     const indexedPd2FileIds = getIndexedFileIds(db, pd2SourceId)
+    const indexedPd2ModIds = getIndexedModIds(db, pd2SourceId)
     const missingNamePd3FileIds = BACKFILL ? getFileIdsMissingNames(db, pd3SourceId) : new Set<number>()
     const missingNamePd2FileIds = BACKFILL ? getFileIdsMissingNames(db, pd2SourceId) : new Set<number>()
     console.log(
@@ -764,61 +776,80 @@ async function main(): Promise<void> {
 
     // --- PD2 tasks ---
 
+    // Writes one PD2 file's entries into the DB. Returns true if anything was stored.
+    const storePd2 = (modId: number, fileId: number, version: string, entries: PakEntry[]) => {
+        if (entries.length === 0) return
+        db.transaction(() => {
+            for (const { sha256, entryName } of entries) {
+                insertContent.run(sha256)
+                const { changes } = insertFile.run(
+                    modId,
+                    sha256,
+                    fileId,
+                    version,
+                    new Date().toISOString(),
+                    entryName
+                )
+                if (changes > 0) newFiles++
+                else if (fillEntryName.run(entryName, modId, sha256).changes > 0) filledNames++
+            }
+        })()
+        indexedPd2FileIds.add(fileId)
+        missingNamePd2FileIds.delete(fileId)
+    }
+
     const pd2Tasks: Task[] = pd2Mods.map((mod) => async () => {
-        // Only 'file' downloads are hosted archives; 'link'/null are external — skip, no call.
-        if (mod.download_type !== 'file' || mod.download_id == null) {
-            donePd2++
-            return
-        }
-
-        // download_id is the file's remote_id — already-indexed files cost zero API calls.
-        const fileId = mod.download_id
-        if (indexedPd2FileIds.has(fileId) && !missingNamePd2FileIds.has(fileId)) {
-            donePd2++
-            return
-        }
-
-        let resolved: { url: string; size: number | null } | null
-        try {
-            resolved = await resolveDownload(fileId)
-        } catch (e) {
-            errors.push(`pd2 mod ${mod.id}: failed to resolve download — ${e}`)
-            donePd2++
-            return
-        }
-        if (!resolved) {
+        if (!mod.has_download) {
             donePd2++
             return
         }
 
         const modUrl = `https://modworkshop.net/mod/${mod.id}`
-        insertMod.run(pd2SourceId, mod.id, mod.name, modUrl)
-        const { id: modId } = getModId.get(pd2SourceId, mod.id) as { id: number }
 
-        try {
-            const entries = await extractPd2Entries(resolved.url, resolved.size)
-            if (entries.length > 0) {
-                db.transaction(() => {
-                    for (const { sha256, entryName } of entries) {
-                        insertContent.run(sha256)
-                        const { changes } = insertFile.run(
-                            modId,
-                            sha256,
-                            fileId,
-                            mod.version,
-                            new Date().toISOString(),
-                            entryName
-                        )
-                        if (changes > 0) newFiles++
-                        else if (fillEntryName.run(entryName, modId, sha256).changes > 0)
-                            filledNames++
-                    }
-                })()
-                indexedPd2FileIds.add(fileId)
-                missingNamePd2FileIds.delete(fileId)
+        // Fast path: the listing surfaced a hosted primary download. download_id is the
+        // file's remote_id, so already-indexed files cost zero API calls.
+        if (mod.download_type === 'file' && mod.download_id != null) {
+            const fileId = mod.download_id
+            if (indexedPd2FileIds.has(fileId) && !missingNamePd2FileIds.has(fileId)) {
+                donePd2++
+                return
             }
-        } catch (e) {
-            errors.push(`pd2 mod ${mod.id} file ${fileId}: ${e}`)
+            try {
+                const resolved = await resolveDownload(fileId)
+                if (resolved) {
+                    insertMod.run(pd2SourceId, mod.id, mod.name, modUrl)
+                    const { id: modId } = getModId.get(pd2SourceId, mod.id) as { id: number }
+                    storePd2(modId, fileId, mod.version, await extractPd2Entries(resolved.url, resolved.size))
+                }
+            } catch (e) {
+                errors.push(`pd2 mod ${mod.id} file ${fileId}: ${e}`)
+            }
+        } else if (!indexedPd2ModIds.has(mod.id)) {
+            // Fallback: has_download but the listing carried no download_id (download_type
+            // null/link). The /files endpoint still lists the real archive(s).
+            let files: ModFile[] = []
+            try {
+                files = await listModFiles(mod.id)
+            } catch (e) {
+                errors.push(`pd2 mod ${mod.id}: failed to list files — ${e}`)
+                donePd2++
+                return
+            }
+            if (files.length > 0) {
+                insertMod.run(pd2SourceId, mod.id, mod.name, modUrl)
+                const { id: modId } = getModId.get(pd2SourceId, mod.id) as { id: number }
+                for (const file of files) {
+                    if (indexedPd2FileIds.has(file.id) && !missingNamePd2FileIds.has(file.id)) {
+                        continue
+                    }
+                    try {
+                        // file.download_url is already a storage URL — extract directly.
+                        storePd2(modId, file.id, file.version, await extractPd2Entries(file.download_url, null))
+                    } catch (e) {
+                        errors.push(`pd2 mod ${mod.id} file ${file.id}: ${e}`)
+                    }
+                }
+            }
         }
 
         donePd2++
