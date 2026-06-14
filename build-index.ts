@@ -678,6 +678,17 @@ async function main(): Promise<void> {
             donePd3++
             return
         }
+        // Primary download already indexed: skip the per-mod /files call. A real file
+        // update gets a new download_id (so it won't be in the set and is re-fetched);
+        // an unchanged mod costs zero API calls instead of a throttled /files request.
+        if (
+            mod.download_id != null &&
+            indexedPd3FileIds.has(mod.download_id) &&
+            !missingNamePd3FileIds.has(mod.download_id)
+        ) {
+            donePd3++
+            return
+        }
         let files: ModFile[] = []
         try {
             files = await listModFiles(mod.id)
