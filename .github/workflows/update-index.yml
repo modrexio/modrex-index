@@ -56,7 +56,14 @@ jobs:
         if: ${{ !inputs.full_rebuild }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release download latest-index --pattern index.db --output index.db 2>/dev/null || true
+        run: |
+          gh release download latest-index --pattern index.db --output index.db 2>/dev/null || true
+          # Guard: a partial/corrupt download must not be written back. If it doesn't open
+          # and pass integrity_check, discard it so the indexer rebuilds clean instead.
+          if [ -f index.db ] && ! node -e "const d=new(require('better-sqlite3'))('index.db',{readonly:true});const ok=d.pragma('integrity_check',{simple:true})==='ok';d.close();process.exit(ok?0:1)" 2>/dev/null; then
+            echo "Downloaded index.db is corrupt or partial — discarding; the run will rebuild."
+            rm -f index.db index.db-wal index.db-shm
+          fi
 
       - name: Run indexer
         id: indexer
