@@ -29,6 +29,9 @@ const USER_AGENT = 'modrex-indexer/1.0'
 const DB_PATH = join(import.meta.dirname, 'index.db')
 // Faster than full_rebuild when adding a new format: only unindexed files are downloaded.
 const BACKFILL = process.argv.includes('--backfill')
+// Patches only the version column on existing rows from the listings — no downloads, no
+// extraction. Lets a stale-version index be corrected in minutes instead of a full backfill.
+const REPAIR_VERSIONS = process.argv.includes('--repair-versions')
 const CONCURRENCY = parseInt(
     process.argv.find((a) => a.startsWith('--concurrency='))?.split('=')[1] ?? (BACKFILL ? '10' : '5')
 )
@@ -672,13 +675,37 @@ async function main(): Promise<void> {
     let filledNames = 0
 
     // Fetch both mod lists before building tasks so closures can reference both lengths.
+    // Repair scans every mod (since = null) so it can correct any stale version.
+    const since = BACKFILL || REPAIR_VERSIONS ? null : lastRunAt
     console.log('Fetching PD3 mod list...')
-    const pd3Mods = await listModsSince(PD3_GAME_ID, BACKFILL ? null : lastRunAt)
+    const pd3Mods = await listModsSince(PD3_GAME_ID, since)
     console.log(`  ${pd3Mods.length} PD3 mods to process\n`)
 
     console.log('Fetching PD2 mod list...')
-    const pd2Mods = await listModsSince(PD2_GAME_ID, BACKFILL ? null : lastRunAt)
+    const pd2Mods = await listModsSince(PD2_GAME_ID, since)
     console.log(`  ${pd2Mods.length} PD2 mods to process\n`)
+
+    // Version-only repair: rewrite the version column on already-indexed files from the
+    // listing's mod.version, then exit. No downloads — turns a 3-hour backfill into minutes.
+    if (REPAIR_VERSIONS) {
+        const updateVer = db.prepare(
+            'UPDATE files SET version = ? WHERE mod_id = ? AND version != ?'
+        )
+        let fixed = 0
+        const repair = (mods: Mod[], sourceId: number) =>
+            db.transaction(() => {
+                for (const mod of mods) {
+                    if (!mod.version) continue
+                    const m = getModId.get(sourceId, mod.id) as { id: number } | undefined
+                    if (m) fixed += updateVer.run(mod.version, m.id, mod.version).changes
+                }
+            })()
+        repair(pd3Mods, pd3SourceId)
+        repair(pd2Mods, pd2SourceId)
+        console.log(`\nVersion repair: rewrote ${fixed} file version(s).`)
+        db.close()
+        process.exit(fixed > 0 ? 0 : 2)
+    }
 
     let donePd3 = 0
     let donePd2 = 0
@@ -844,7 +871,14 @@ async function main(): Promise<void> {
                     }
                     try {
                         // file.download_url is already a storage URL — extract directly.
-                        storePd2(modId, file.id, file.version, await extractPd2Entries(file.download_url, null))
+                        // Use the mod-level version (the per-file one is usually blank for PD2);
+                        // modrex-main compares installs against the mod version for updates.
+                        storePd2(
+                            modId,
+                            file.id,
+                            file.version || mod.version,
+                            await extractPd2Entries(file.download_url, null)
+                        )
                     } catch (e) {
                         errors.push(`pd2 mod ${mod.id} file ${file.id}: ${e}`)
                     }

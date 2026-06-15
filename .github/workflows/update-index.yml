@@ -11,6 +11,10 @@ on:
         description: 'Backfill (scan all mods but skip already-indexed files — use after adding a new format or a new game)'
         type: boolean
         default: false
+      repair_versions:
+        description: 'Repair versions only (rewrite the version column from the listings — no downloads, ~minutes)'
+        type: boolean
+        default: false
       concurrency:
         description: 'Storage download parallelism (default 5, backfill 10; API calls are throttled separately so higher is safe)'
         type: string
@@ -60,6 +64,7 @@ jobs:
           set +e
           args=""
           ${{ inputs.backfill == true }} && args="$args --backfill"
+          ${{ inputs.repair_versions == true }} && args="$args --repair-versions"
           [ -n "${{ inputs.concurrency }}" ] && args="$args --concurrency=${{ inputs.concurrency }}"
           pnpm build-index $args
           code=$?
