@@ -57,12 +57,28 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release download latest-index --pattern index.db --output index.db 2>/dev/null || true
-          # Guard: a partial/corrupt download must not be written back. If it doesn't open
-          # and pass integrity_check, discard it so the indexer rebuilds clean instead.
-          if [ -f index.db ] && ! node -e "const d=new(require('better-sqlite3'))('index.db',{readonly:true});const ok=d.pragma('integrity_check',{simple:true})==='ok';d.close();process.exit(ok?0:1)" 2>/dev/null; then
-            echo "Downloaded index.db is corrupt or partial — discarding; the run will rebuild."
+          # Retry + integrity-check the download. GitHub's release CDN can briefly serve a
+          # stale/partial copy after an asset is replaced; proceeding on a corrupt index.db
+          # would either crash or (worse) write the damage back. Fail safely instead.
+          ok=0
+          for i in 1 2 3 4 5; do
             rm -f index.db index.db-wal index.db-shm
+            # Fetch via the API asset endpoint (api.github.com), not the release-download
+            # CDN — that CDN keys on the path and can serve a stale/corrupt copy long after
+            # the asset is replaced.
+            aid=$(gh api "repos/${{ github.repository }}/releases/tags/latest-index" --jq '.assets[] | select(.name=="index.db") | .id' 2>/dev/null)
+            if [ -n "$aid" ]; then
+              gh api -H "Accept: application/octet-stream" "repos/${{ github.repository }}/releases/assets/$aid" > index.db 2>/dev/null || true
+            fi
+            if [ -f index.db ] && node -e "const d=new(require('better-sqlite3'))('index.db',{readonly:true});const ok=d.pragma('integrity_check',{simple:true})==='ok';d.close();process.exit(ok?0:1)" 2>/dev/null; then
+              ok=1; break
+            fi
+            echo "download attempt $i: index.db missing/corrupt — retrying in 15s"
+            sleep 15
+          done
+          if [ "$ok" != 1 ]; then
+            echo "Could not fetch a valid index.db after retries; failing without touching the release."
+            exit 1
           fi
 
       - name: Run indexer
