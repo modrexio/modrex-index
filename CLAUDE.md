@@ -41,7 +41,15 @@ files   (id, mod_id, remote_id, version, sha256, entry_name)  -- one row per .pa
 
 ### GitHub Actions workflow
 
-Runs hourly. Downloads all mod files from modworkshop, hashes each `.pak`, writes `index.db`, uploads as a release asset to the `latest-index` tag (always overwrites — one tag, one asset, consumers always hit the same URL).
+Runs hourly. Hashes mod files from modworkshop, writes `index.db`, uploads as a release asset to the `latest-index` tag (always overwrites — one tag, one asset, consumers always hit the same URL).
+
+**Run modes** (`workflow_dispatch` inputs / CLI flags):
+
+- _default_ — incremental and **time-windowed**: `listModsSince(lastRunAt)` only examines mods updated since the previous run, and skips files already in `files`.
+- `--backfill` — scans **all** mods (`since = null`), still skipping already-indexed files. **Required after any coverage change** (a new archive format, a new game, or raising `PD2_MAX_FULL_DOWNLOAD_BYTES`): the default run never revisits older mods, so previously-skipped files only get picked up by a backfill.
+- `--repair-versions` — rewrites the `version` column from the listings; no downloads.
+
+PD2/PDTH mods aren't `.pak` — for them the indexer hashes one representative marker file per mod (`mod.txt` / `main.xml` / wrapper-relative first file via `selectMarkerPath`, chosen to match `modrex-main`'s `first_file_in_dir`). ZIPs use HTTP Range to fetch only that file; RAR/7z have no such trick, so they're fully downloaded and gated by `PD2_MAX_FULL_DOWNLOAD_BYTES` (50 MB) — larger ones are skipped. This is what lets `modrex-main` identify marker-less asset/background packs (incl. recovered host packs) by SHA256.
 
 ## Rules
 
