@@ -9,7 +9,7 @@
  * PD3: streams each download directly into SHA256 (no temp files for .pak extraction).
  * PD2: uses HTTP Range requests on ZIP archives to fetch only the marker file
  *      (mod.txt / main.xml / first alphabetical file) without downloading the full archive.
- *      RAR and 7z archives under 10 MB are fully downloaded and extracted via the 7z CLI.
+ *      RAR and 7z archives under 50 MB are fully downloaded and extracted via the 7z CLI.
  * Downloads CONCURRENCY files in parallel to cut total runtime.
  */
 
@@ -41,8 +41,11 @@ const CONCURRENCY = parseInt(
 const API_RATE_PER_MIN = 85
 const API_MIN_INTERVAL_MS = Math.ceil(60_000 / API_RATE_PER_MIN)
 let apiNextSlot = 0
-// RAR and 7z archives larger than this are skipped for PD2 (no efficient marker extraction).
-const PD2_MAX_FULL_DOWNLOAD_BYTES = 10 * 1_024 * 1_024
+// RAR and 7z archives larger than this are skipped for PD2: they have no efficient marker
+// extraction (unlike ZIP's Range trick), so the whole archive must be downloaded. The cap bounds
+// per-file CI cost; downloads are incremental so raising it drains the newly-eligible backlog
+// over successive hourly runs. 50 MB covers most asset/background packs (e.g. menu backgrounds).
+const PD2_MAX_FULL_DOWNLOAD_BYTES = 50 * 1_024 * 1_024
 
 // --- types ---
 
