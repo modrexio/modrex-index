@@ -1,6 +1,6 @@
 #!/usr/bin/env npx tsx
 /**
- * Builds the PD3 + PD2 mod hash index from modworkshop directly into SQLite.
+ * Builds the PD3 + PD2 + PDTH mod hash index from modworkshop directly into SQLite.
  *
  * Run:   pnpm build-index
  * Output: index.db
@@ -25,6 +25,7 @@ import { tmpdir } from 'os'
 const BASE = 'https://api.modworkshop.net'
 const PD3_GAME_ID = 853
 const PD2_GAME_ID = 1
+const PDTH_GAME_ID = 2
 const USER_AGENT = 'modrex-indexer/1.0'
 const DB_PATH = join(import.meta.dirname, 'index.db')
 // Faster than full_rebuild when adding a new format: only unindexed files are downloaded.
@@ -128,7 +129,7 @@ CREATE TABLE IF NOT EXISTS metadata (
 
 // --- db setup ---
 
-function openDb(): { db: DB; pd3SourceId: number; pd2SourceId: number } {
+function openDb(): { db: DB; pd3SourceId: number; pd2SourceId: number; pdthSourceId: number } {
     const db = new Database(DB_PATH)
     db.exec(SCHEMA)
 
@@ -156,7 +157,12 @@ function openDb(): { db: DB; pd3SourceId: number; pd2SourceId: number } {
     upsertSource.run(pd2Game.id, 'modworkshop', BASE, String(PD2_GAME_ID))
     const pd2Source = getSource.get(pd2Game.id, 'modworkshop') as { id: number }
 
-    return { db, pd3SourceId: pd3Source.id, pd2SourceId: pd2Source.id }
+    upsertGame.run('PAYDAY: The Heist', 'pdth')
+    const pdthGame = getGame.get('pdth') as { id: number }
+    upsertSource.run(pdthGame.id, 'modworkshop', BASE, String(PDTH_GAME_ID))
+    const pdthSource = getSource.get(pdthGame.id, 'modworkshop') as { id: number }
+
+    return { db, pd3SourceId: pd3Source.id, pd2SourceId: pd2Source.id, pdthSourceId: pdthSource.id }
 }
 
 // Scope indexed file IDs to a specific source so PD2 and PD3 remote_ids never collide.
@@ -446,6 +452,13 @@ function selectMarkerPath(paths: string[]): string | null {
     })
     if (modTxt) return modTxt
 
+    // DAHM sub-mods (PDTH) use base.lua as their entry point instead of mod.txt
+    const baseLua = files.find((p) => {
+        const l = p.toLowerCase()
+        return (l === 'base.lua' || l.endsWith('/base.lua')) && depth(p) <= 1
+    })
+    if (baseLua) return baseLua
+
     const mainXml = files.find((p) => {
         const l = p.toLowerCase()
         return (l === 'main.xml' || l.endsWith('/main.xml')) && depth(p) <= 1
@@ -630,18 +643,21 @@ function shouldDownload(type: string): boolean {
 
 async function main(): Promise<void> {
     console.log('Opening database...')
-    const { db, pd3SourceId, pd2SourceId } = openDb()
+    const { db, pd3SourceId, pd2SourceId, pdthSourceId } = openDb()
     const indexedPd3FileIds = getIndexedFileIds(db, pd3SourceId)
     const indexedPd2FileIds = getIndexedFileIds(db, pd2SourceId)
+    const indexedPdthFileIds = getIndexedFileIds(db, pdthSourceId)
     const indexedPd2ModIds = getIndexedModIds(db, pd2SourceId)
+    const indexedPdthModIds = getIndexedModIds(db, pdthSourceId)
     const missingNamePd3FileIds = BACKFILL ? getFileIdsMissingNames(db, pd3SourceId) : new Set<number>()
     const missingNamePd2FileIds = BACKFILL ? getFileIdsMissingNames(db, pd2SourceId) : new Set<number>()
+    const missingNamePdthFileIds = BACKFILL ? getFileIdsMissingNames(db, pdthSourceId) : new Set<number>()
     console.log(
-        `  ${indexedPd3FileIds.size} PD3 files + ${indexedPd2FileIds.size} PD2 files already indexed`
+        `  ${indexedPd3FileIds.size} PD3 + ${indexedPd2FileIds.size} PD2 + ${indexedPdthFileIds.size} PDTH files already indexed`
     )
-    if (BACKFILL && (missingNamePd3FileIds.size > 0 || missingNamePd2FileIds.size > 0)) {
+    if (BACKFILL && (missingNamePd3FileIds.size > 0 || missingNamePd2FileIds.size > 0 || missingNamePdthFileIds.size > 0)) {
         console.log(
-            `  ${missingNamePd3FileIds.size} PD3 + ${missingNamePd2FileIds.size} PD2 files missing entry names — will re-download`
+            `  ${missingNamePd3FileIds.size} PD3 + ${missingNamePd2FileIds.size} PD2 + ${missingNamePdthFileIds.size} PDTH files missing entry names — will re-download`
         )
     }
 
@@ -688,6 +704,10 @@ async function main(): Promise<void> {
     const pd2Mods = await listModsSince(PD2_GAME_ID, since)
     console.log(`  ${pd2Mods.length} PD2 mods to process\n`)
 
+    console.log('Fetching PDTH mod list...')
+    const pdthMods = await listModsSince(PDTH_GAME_ID, since)
+    console.log(`  ${pdthMods.length} PDTH mods to process\n`)
+
     // Version-only repair: rewrite the version column on already-indexed files from the
     // listing's mod.version, then exit. No downloads — turns a 3-hour backfill into minutes.
     if (REPAIR_VERSIONS) {
@@ -705,6 +725,7 @@ async function main(): Promise<void> {
             })()
         repair(pd3Mods, pd3SourceId)
         repair(pd2Mods, pd2SourceId)
+        repair(pdthMods, pdthSourceId)
         console.log(`\nVersion repair: rewrote ${fixed} file version(s).`)
         db.close()
         process.exit(fixed > 0 ? 0 : 2)
@@ -712,6 +733,7 @@ async function main(): Promise<void> {
 
     let donePd3 = 0
     let donePd2 = 0
+    let donePdth = 0
 
     // --- PD3 tasks ---
 
@@ -799,7 +821,7 @@ async function main(): Promise<void> {
         if (donePd3 % 50 === 0) {
             const total = (db.prepare('SELECT COUNT(*) as n FROM files').get() as { n: number }).n
             console.log(
-                `  [PD3: ${donePd3}/${pd3Mods.length} — PD2: ${donePd2}/${pd2Mods.length} — ${total} files indexed]`
+                `  [PD3: ${donePd3}/${pd3Mods.length} — PD2: ${donePd2}/${pd2Mods.length} — PDTH: ${donePdth}/${pdthMods.length} — ${total} files indexed]`
             )
         }
     })
@@ -893,15 +915,101 @@ async function main(): Promise<void> {
         if (donePd2 % 200 === 0) {
             const total = (db.prepare('SELECT COUNT(*) as n FROM files').get() as { n: number }).n
             console.log(
-                `  [PD3: ${donePd3}/${pd3Mods.length} — PD2: ${donePd2}/${pd2Mods.length} — ${total} files indexed]`
+                `  [PD3: ${donePd3}/${pd3Mods.length} — PD2: ${donePd2}/${pd2Mods.length} — PDTH: ${donePdth}/${pdthMods.length} — ${total} files indexed]`
+            )
+        }
+    })
+
+    // --- PDTH tasks (same extraction strategy as PD2) ---
+
+    const storePdth = (modId: number, fileId: number, version: string, entries: PakEntry[]) => {
+        if (entries.length === 0) return
+        db.transaction(() => {
+            for (const { sha256, entryName } of entries) {
+                insertContent.run(sha256)
+                const { changes } = insertFile.run(
+                    modId,
+                    sha256,
+                    fileId,
+                    version,
+                    new Date().toISOString(),
+                    entryName
+                )
+                if (changes > 0) newFiles++
+                else if (fillEntryName.run(entryName, modId, sha256).changes > 0) filledNames++
+            }
+        })()
+        indexedPdthFileIds.add(fileId)
+        missingNamePdthFileIds.delete(fileId)
+    }
+
+    const pdthTasks: Task[] = pdthMods.map((mod) => async () => {
+        if (!mod.has_download) {
+            donePdth++
+            return
+        }
+
+        const modUrl = `https://modworkshop.net/mod/${mod.id}`
+
+        if (mod.download_type === 'file' && mod.download_id != null) {
+            const fileId = mod.download_id
+            if (indexedPdthFileIds.has(fileId) && !missingNamePdthFileIds.has(fileId)) {
+                donePdth++
+                return
+            }
+            try {
+                const resolved = await resolveDownload(fileId)
+                if (resolved) {
+                    insertMod.run(pdthSourceId, mod.id, mod.name, modUrl)
+                    const { id: modId } = getModId.get(pdthSourceId, mod.id) as { id: number }
+                    storePdth(modId, fileId, mod.version, await extractPd2Entries(resolved.url, resolved.size))
+                }
+            } catch (e) {
+                errors.push(`pdth mod ${mod.id} file ${fileId}: ${e}`)
+            }
+        } else if (!indexedPdthModIds.has(mod.id)) {
+            let files: ModFile[] = []
+            try {
+                files = await listModFiles(mod.id)
+            } catch (e) {
+                errors.push(`pdth mod ${mod.id}: failed to list files — ${e}`)
+                donePdth++
+                return
+            }
+            if (files.length > 0) {
+                insertMod.run(pdthSourceId, mod.id, mod.name, modUrl)
+                const { id: modId } = getModId.get(pdthSourceId, mod.id) as { id: number }
+                for (const file of files) {
+                    if (indexedPdthFileIds.has(file.id) && !missingNamePdthFileIds.has(file.id)) {
+                        continue
+                    }
+                    try {
+                        storePdth(
+                            modId,
+                            file.id,
+                            file.version || mod.version,
+                            await extractPd2Entries(file.download_url, null)
+                        )
+                    } catch (e) {
+                        errors.push(`pdth mod ${mod.id} file ${file.id}: ${e}`)
+                    }
+                }
+            }
+        }
+
+        donePdth++
+        if (donePdth % 50 === 0) {
+            const total = (db.prepare('SELECT COUNT(*) as n FROM files').get() as { n: number }).n
+            console.log(
+                `  [PD3: ${donePd3}/${pd3Mods.length} — PD2: ${donePd2}/${pd2Mods.length} — PDTH: ${donePdth}/${pdthMods.length} — ${total} files indexed]`
             )
         }
     })
 
     console.log(
-        `Processing ${pd3Mods.length} PD3 + ${pd2Mods.length} PD2 mods with ${CONCURRENCY} workers...\n`
+        `Processing ${pd3Mods.length} PD3 + ${pd2Mods.length} PD2 + ${pdthMods.length} PDTH mods with ${CONCURRENCY} workers...\n`
     )
-    await runPool([...pd3Tasks, ...pd2Tasks], CONCURRENCY)
+    await runPool([...pd3Tasks, ...pd2Tasks, ...pdthTasks], CONCURRENCY)
 
     db.prepare('INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)').run(
         'last_run_at',
