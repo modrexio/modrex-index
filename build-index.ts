@@ -322,7 +322,7 @@ async function downloadBuffer(downloadUrl: string): Promise<Buffer> {
     return Buffer.from(await res.arrayBuffer())
 }
 
-function detectFormat(buf: Buffer): 'zip' | '7z' | 'pak' {
+function detectFormat(buf: Buffer): 'zip' | '7z' | 'rar' | 'pak' {
     if (buf.length >= 4 && buf[0] === 0x50 && buf[1] === 0x4b && buf[2] === 0x03 && buf[3] === 0x04)
         return 'zip'
     if (
@@ -335,6 +335,16 @@ function detectFormat(buf: Buffer): 'zip' | '7z' | 'pak' {
         buf[5] === 0x1c
     )
         return '7z'
+    if (
+        buf.length >= 6 &&
+        buf[0] === 0x52 &&
+        buf[1] === 0x61 &&
+        buf[2] === 0x72 &&
+        buf[3] === 0x21 &&
+        buf[4] === 0x1a &&
+        buf[5] === 0x07
+    )
+        return 'rar'
     return 'pak'
 }
 
@@ -389,6 +399,34 @@ function extractContentEntries(buf: Buffer, fallbackName: string): ContentEntry[
             )
             return (readdirSync(out, { recursive: true }) as string[])
                 .filter(matchesContentExtension)
+                .map((f) => ({
+                    sha256: createHash('sha256').update(readFileSync(join(out, f))).digest('hex'),
+                    entryName: f.replace(/\\/g, '/'),
+                }))
+        } catch {
+            return []
+        } finally {
+            rmSync(tmp, { recursive: true, force: true })
+        }
+    }
+
+    if (fmt === 'rar') {
+        // 7z's RAR support doesn't take the same multi-mask filter reliably, so (matching
+        // extractPd2FromFull's existing RAR handling) extract everything and filter in JS.
+        const tmp = mkdtempSync(join(tmpdir(), 'modrex-idx-'))
+        try {
+            const archive = join(tmp, 'archive.rar')
+            const out = join(tmp, 'out')
+            writeFileSync(archive, buf)
+            execFileSync('7z', ['x', archive, '-o' + out, '-y'], { stdio: 'ignore' })
+            return (readdirSync(out, { recursive: true }) as string[])
+                .filter((f) => {
+                    try {
+                        return matchesContentExtension(f) && statSync(join(out, f)).isFile()
+                    } catch {
+                        return false
+                    }
+                })
                 .map((f) => ({
                     sha256: createHash('sha256').update(readFileSync(join(out, f))).digest('hex'),
                     entryName: f.replace(/\\/g, '/'),
@@ -670,6 +708,7 @@ function shouldDownload(type: string): boolean {
         t.includes('pak') ||
         t.includes('zip') ||
         t.includes('7z') ||
+        t.includes('rar') ||
         t === 'application/octet-stream' ||
         t === 'application/zip' ||
         t === ''
