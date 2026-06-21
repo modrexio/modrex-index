@@ -1,13 +1,15 @@
 #!/usr/bin/env npx tsx
 /**
- * Builds the PD3 + PD2 + PDTH mod hash index from modworkshop directly into SQLite.
+ * Builds the PD3 + PD2 + PDTH + Crime Boss mod hash index from modworkshop directly into
+ * SQLite.
  *
  * Run:   pnpm build-index
  * Output: index.db
  *
  * Resumable — already-indexed fileIds are skipped on re-run.
- * PD3: streams each download directly into SHA256 (no temp files for .pak extraction).
- * PD2: uses HTTP Range requests on ZIP archives to fetch only the marker file
+ * PD3 / Crime Boss: streams each download directly into SHA256, extracting .pak/.ucas/.utoc
+ *      (UE5 IoStore content) and .lua (UE4SS Lua sub-mods) — no temp files needed for ZIP.
+ * PD2 / PDTH: uses HTTP Range requests on ZIP archives to fetch only the marker file
  *      (mod.txt / main.xml / first alphabetical file) without downloading the full archive.
  *      RAR and 7z archives under 50 MB are fully downloaded and extracted via the 7z CLI.
  * Downloads CONCURRENCY files in parallel to cut total runtime.
@@ -26,6 +28,7 @@ const BASE = 'https://api.modworkshop.net'
 const PD3_GAME_ID = 853
 const PD2_GAME_ID = 1
 const PDTH_GAME_ID = 2
+const CRIMEBOSS_GAME_ID = 857
 const USER_AGENT = 'modrex-indexer/1.0'
 const DB_PATH = join(import.meta.dirname, 'index.db')
 // Faster than full_rebuild when adding a new format: only unindexed files are downloaded.
@@ -129,7 +132,13 @@ CREATE TABLE IF NOT EXISTS metadata (
 
 // --- db setup ---
 
-function openDb(): { db: DB; pd3SourceId: number; pd2SourceId: number; pdthSourceId: number } {
+function openDb(): {
+    db: DB
+    pd3SourceId: number
+    pd2SourceId: number
+    pdthSourceId: number
+    cbSourceId: number
+} {
     const db = new Database(DB_PATH)
     db.exec(SCHEMA)
 
@@ -162,7 +171,21 @@ function openDb(): { db: DB; pd3SourceId: number; pd2SourceId: number; pdthSourc
     upsertSource.run(pdthGame.id, 'modworkshop', BASE, String(PDTH_GAME_ID))
     const pdthSource = getSource.get(pdthGame.id, 'modworkshop') as { id: number }
 
-    return { db, pd3SourceId: pd3Source.id, pd2SourceId: pd2Source.id, pdthSourceId: pdthSource.id }
+    // Slug/name match modrex-main's CRIMEBOSS_ENGINE.index_game_name exactly — modrex-main
+    // joins files -> mods -> sources -> games filtered by games.name, so this string is load-
+    // bearing, not cosmetic.
+    upsertGame.run('Crime Boss: Rockay City', 'cb')
+    const cbGame = getGame.get('cb') as { id: number }
+    upsertSource.run(cbGame.id, 'modworkshop', BASE, String(CRIMEBOSS_GAME_ID))
+    const cbSource = getSource.get(cbGame.id, 'modworkshop') as { id: number }
+
+    return {
+        db,
+        pd3SourceId: pd3Source.id,
+        pd2SourceId: pd2Source.id,
+        pdthSourceId: pdthSource.id,
+        cbSourceId: cbSource.id,
+    }
 }
 
 // Scope indexed file IDs to a specific source so PD2 and PD3 remote_ids never collide.
@@ -315,14 +338,26 @@ function detectFormat(buf: Buffer): 'zip' | '7z' | 'pak' {
     return 'pak'
 }
 
-interface PakEntry {
+interface ContentEntry {
     sha256: string
     entryName: string
 }
 
-// Returns SHA256 + in-archive path of all .pak content in buf, extracting
-// archives as needed. fallbackName names the buffer itself for bare .pak files.
-function extractPakEntries(buf: Buffer, fallbackName: string): PakEntry[] {
+// .pak/.ucas/.utoc are UE5 IoStore's three pieces of a mod's cooked content (PD3, Crime
+// Boss); .lua is a UE4SS Lua sub-mod's script entry point — see modrex-main's CLAUDE.md
+// "UE4SS" section for why this is needed for sub-mod identification, and the known
+// caveat (first_file_in_dir's alphabetical pick doesn't always agree with which .lua this
+// hashes when a sub-mod has other root-level files).
+const CONTENT_EXTENSIONS = ['.pak', '.ucas', '.utoc', '.lua']
+const has7zMaskFor = (ext: string) => `*${ext}`
+const matchesContentExtension = (name: string) => {
+    const lower = name.toLowerCase()
+    return CONTENT_EXTENSIONS.some((ext) => lower.endsWith(ext))
+}
+
+// Returns SHA256 + in-archive path of all hashable content in buf (see CONTENT_EXTENSIONS),
+// extracting archives as needed. fallbackName names the buffer itself for bare files.
+function extractContentEntries(buf: Buffer, fallbackName: string): ContentEntry[] {
     const fmt = detectFormat(buf)
 
     if (fmt === 'zip') {
@@ -330,7 +365,7 @@ function extractPakEntries(buf: Buffer, fallbackName: string): PakEntry[] {
             const zip = new AdmZip(buf)
             return zip
                 .getEntries()
-                .filter((e) => !e.isDirectory && e.entryName.toLowerCase().endsWith('.pak'))
+                .filter((e) => !e.isDirectory && matchesContentExtension(e.entryName))
                 .map((e) => ({
                     sha256: createHash('sha256').update(e.getData()).digest('hex'),
                     entryName: e.entryName.replace(/\\/g, '/'),
@@ -347,11 +382,13 @@ function extractPakEntries(buf: Buffer, fallbackName: string): PakEntry[] {
             const out = join(tmp, 'out')
             writeFileSync(archive, buf)
             // x (not e) keeps directory structure so entry paths survive
-            execFileSync('7z', ['x', archive, '-o' + out, '*.pak', '-r', '-y'], {
-                stdio: 'ignore',
-            })
+            execFileSync(
+                '7z',
+                ['x', archive, '-o' + out, ...CONTENT_EXTENSIONS.map(has7zMaskFor), '-r', '-y'],
+                { stdio: 'ignore' }
+            )
             return (readdirSync(out, { recursive: true }) as string[])
-                .filter((f) => f.toLowerCase().endsWith('.pak'))
+                .filter(matchesContentExtension)
                 .map((f) => ({
                     sha256: createHash('sha256').update(readFileSync(join(out, f))).digest('hex'),
                     entryName: f.replace(/\\/g, '/'),
@@ -481,7 +518,7 @@ function selectMarkerPath(paths: string[]): string | null {
 }
 
 // Typically fetches only ~100 KB regardless of archive size.
-async function extractPd2FromZip(url: string, knownSize: number | null): Promise<PakEntry | null> {
+async function extractPd2FromZip(url: string, knownSize: number | null): Promise<ContentEntry | null> {
     const size = knownSize ?? (await headContentLength(url))
     if (!size || size < 22) return null
 
@@ -532,7 +569,7 @@ async function extractPd2FromZip(url: string, knownSize: number | null): Promise
 }
 
 // p7zip-full required for RAR support on Ubuntu CI runners.
-async function extractPd2FromFull(url: string, type: string): Promise<PakEntry | null> {
+async function extractPd2FromFull(url: string, type: string): Promise<ContentEntry | null> {
     const buf = await downloadBuffer(url)
     const ext = type === 'rar' ? '.rar' : '.7z'
     const tmp = mkdtempSync(join(tmpdir(), 'modrex-pd2-'))
@@ -591,7 +628,7 @@ async function resolveDownload(
 }
 
 // url is a resolved storage.modworkshop.net URL; archive format comes from its extension.
-async function extractPd2Entries(url: string, size: number | null): Promise<PakEntry[]> {
+async function extractPd2Entries(url: string, size: number | null): Promise<ContentEntry[]> {
     const path = url.split('?')[0].toLowerCase()
 
     if (path.endsWith('.rar') || path.endsWith('.7z')) {
@@ -643,21 +680,29 @@ function shouldDownload(type: string): boolean {
 
 async function main(): Promise<void> {
     console.log('Opening database...')
-    const { db, pd3SourceId, pd2SourceId, pdthSourceId } = openDb()
+    const { db, pd3SourceId, pd2SourceId, pdthSourceId, cbSourceId } = openDb()
     const indexedPd3FileIds = getIndexedFileIds(db, pd3SourceId)
     const indexedPd2FileIds = getIndexedFileIds(db, pd2SourceId)
     const indexedPdthFileIds = getIndexedFileIds(db, pdthSourceId)
+    const indexedCbFileIds = getIndexedFileIds(db, cbSourceId)
     const indexedPd2ModIds = getIndexedModIds(db, pd2SourceId)
     const indexedPdthModIds = getIndexedModIds(db, pdthSourceId)
     const missingNamePd3FileIds = BACKFILL ? getFileIdsMissingNames(db, pd3SourceId) : new Set<number>()
     const missingNamePd2FileIds = BACKFILL ? getFileIdsMissingNames(db, pd2SourceId) : new Set<number>()
     const missingNamePdthFileIds = BACKFILL ? getFileIdsMissingNames(db, pdthSourceId) : new Set<number>()
+    const missingNameCbFileIds = BACKFILL ? getFileIdsMissingNames(db, cbSourceId) : new Set<number>()
     console.log(
-        `  ${indexedPd3FileIds.size} PD3 + ${indexedPd2FileIds.size} PD2 + ${indexedPdthFileIds.size} PDTH files already indexed`
+        `  ${indexedPd3FileIds.size} PD3 + ${indexedPd2FileIds.size} PD2 + ${indexedPdthFileIds.size} PDTH + ${indexedCbFileIds.size} CB files already indexed`
     )
-    if (BACKFILL && (missingNamePd3FileIds.size > 0 || missingNamePd2FileIds.size > 0 || missingNamePdthFileIds.size > 0)) {
+    if (
+        BACKFILL &&
+        (missingNamePd3FileIds.size > 0 ||
+            missingNamePd2FileIds.size > 0 ||
+            missingNamePdthFileIds.size > 0 ||
+            missingNameCbFileIds.size > 0)
+    ) {
         console.log(
-            `  ${missingNamePd3FileIds.size} PD3 + ${missingNamePd2FileIds.size} PD2 + ${missingNamePdthFileIds.size} PDTH files missing entry names — will re-download`
+            `  ${missingNamePd3FileIds.size} PD3 + ${missingNamePd2FileIds.size} PD2 + ${missingNamePdthFileIds.size} PDTH + ${missingNameCbFileIds.size} CB files missing entry names — will re-download`
         )
     }
 
@@ -708,6 +753,10 @@ async function main(): Promise<void> {
     const pdthMods = await listModsSince(PDTH_GAME_ID, since)
     console.log(`  ${pdthMods.length} PDTH mods to process\n`)
 
+    console.log('Fetching Crime Boss mod list...')
+    const cbMods = await listModsSince(CRIMEBOSS_GAME_ID, since)
+    console.log(`  ${cbMods.length} Crime Boss mods to process\n`)
+
     // Version-only repair: rewrite the version column on already-indexed files from the
     // listing's mod.version, then exit. No downloads — turns a 3-hour backfill into minutes.
     if (REPAIR_VERSIONS) {
@@ -726,110 +775,127 @@ async function main(): Promise<void> {
         repair(pd3Mods, pd3SourceId)
         repair(pd2Mods, pd2SourceId)
         repair(pdthMods, pdthSourceId)
+        repair(cbMods, cbSourceId)
         console.log(`\nVersion repair: rewrote ${fixed} file version(s).`)
         db.close()
         process.exit(fixed > 0 ? 0 : 2)
     }
 
-    let donePd3 = 0
-    let donePd2 = 0
-    let donePdth = 0
+    const progress = { pd3: 0, pd2: 0, pdth: 0, cb: 0 }
+    const printProgress = () => {
+        const total = (db.prepare('SELECT COUNT(*) as n FROM files').get() as { n: number }).n
+        console.log(
+            `  [PD3: ${progress.pd3}/${pd3Mods.length} — PD2: ${progress.pd2}/${pd2Mods.length} — PDTH: ${progress.pdth}/${pdthMods.length} — CB: ${progress.cb}/${cbMods.length} — ${total} files indexed]`
+        )
+    }
 
-    // --- PD3 tasks ---
+    // --- PD3 / Crime Boss tasks (both UE pak-based, full-archive-download extraction) ---
 
-    const pd3Tasks: Task[] = pd3Mods.map((mod) => async () => {
-        if (!mod.has_download) {
-            donePd3++
-            return
-        }
-        // Primary download already indexed: skip the per-mod /files call. A real file
-        // update gets a new download_id (so it won't be in the set and is re-fetched);
-        // an unchanged mod costs zero API calls instead of a throttled /files request.
-        if (
-            mod.download_id != null &&
-            indexedPd3FileIds.has(mod.download_id) &&
-            !missingNamePd3FileIds.has(mod.download_id)
-        ) {
-            donePd3++
-            return
-        }
-        let files: ModFile[] = []
-        try {
-            files = await listModFiles(mod.id)
-        } catch (e) {
-            errors.push(`pd3 mod ${mod.id}: failed to list files — ${e}`)
-            donePd3++
-            return
-        }
-
-        const modUrl = `https://modworkshop.net/mod/${mod.id}`
-        insertMod.run(pd3SourceId, mod.id, mod.name, modUrl)
-        const { id: modId } = getModId.get(pd3SourceId, mod.id) as { id: number }
-
-        if (BACKFILL && mod.version) {
-            db.prepare('UPDATE files SET version = ? WHERE mod_id = ? AND version != ?').run(
-                mod.version,
-                modId,
-                mod.version
-            )
-        }
-
-        for (const file of files) {
-            if (!shouldDownload(file.type)) continue
-
+    function buildContentTasks(
+        mods: Mod[],
+        sourceId: number,
+        label: keyof typeof progress,
+        indexedFileIds: Set<number>,
+        missingNameFileIds: Set<number>
+    ): Task[] {
+        return mods.map((mod) => async () => {
+            if (!mod.has_download) {
+                progress[label]++
+                return
+            }
+            // Primary download already indexed: skip the per-mod /files call. A real file
+            // update gets a new download_id (so it won't be in the set and is re-fetched);
+            // an unchanged mod costs zero API calls instead of a throttled /files request.
             if (
-                indexedPd3FileIds.has(file.id) &&
-                !missingNamePd3FileIds.has(file.id) &&
-                (!lastRunAt ||
-                    new Date(file.updated_at) <
-                        new Date(lastRunAt.getTime() - SINCE_BUFFER_MS))
+                mod.download_id != null &&
+                indexedFileIds.has(mod.download_id) &&
+                !missingNameFileIds.has(mod.download_id)
             ) {
-                continue
+                progress[label]++
+                return
             }
-
+            let files: ModFile[] = []
             try {
-                const buf = await downloadBuffer(file.download_url)
-                const fallbackName = decodeURIComponent(
-                    new URL(file.download_url).pathname.split('/').pop() ?? ''
-                )
-                const entries = extractPakEntries(buf, fallbackName)
-                if (entries.length === 0) continue
-                db.transaction(() => {
-                    for (const { sha256, entryName } of entries) {
-                        insertContent.run(sha256)
-                        const { changes } = insertFile.run(
-                            modId,
-                            sha256,
-                            file.id,
-                            mod.version,
-                            new Date().toISOString(),
-                            entryName
-                        )
-                        if (changes > 0) newFiles++
-                        else if (fillEntryName.run(entryName, modId, sha256).changes > 0)
-                            filledNames++
-                    }
-                })()
-                indexedPd3FileIds.add(file.id)
-                missingNamePd3FileIds.delete(file.id)
+                files = await listModFiles(mod.id)
             } catch (e) {
-                errors.push(`pd3 mod ${mod.id} file ${file.id}: ${e}`)
+                errors.push(`${label} mod ${mod.id}: failed to list files — ${e}`)
+                progress[label]++
+                return
             }
-        }
 
-        donePd3++
-        if (donePd3 % 50 === 0) {
-            const total = (db.prepare('SELECT COUNT(*) as n FROM files').get() as { n: number }).n
-            console.log(
-                `  [PD3: ${donePd3}/${pd3Mods.length} — PD2: ${donePd2}/${pd2Mods.length} — PDTH: ${donePdth}/${pdthMods.length} — ${total} files indexed]`
-            )
-        }
-    })
+            const modUrl = `https://modworkshop.net/mod/${mod.id}`
+            insertMod.run(sourceId, mod.id, mod.name, modUrl)
+            const { id: modId } = getModId.get(sourceId, mod.id) as { id: number }
+
+            if (BACKFILL && mod.version) {
+                db.prepare('UPDATE files SET version = ? WHERE mod_id = ? AND version != ?').run(
+                    mod.version,
+                    modId,
+                    mod.version
+                )
+            }
+
+            for (const file of files) {
+                if (!shouldDownload(file.type)) continue
+
+                if (
+                    indexedFileIds.has(file.id) &&
+                    !missingNameFileIds.has(file.id) &&
+                    (!lastRunAt ||
+                        new Date(file.updated_at) <
+                            new Date(lastRunAt.getTime() - SINCE_BUFFER_MS))
+                ) {
+                    continue
+                }
+
+                try {
+                    const buf = await downloadBuffer(file.download_url)
+                    const fallbackName = decodeURIComponent(
+                        new URL(file.download_url).pathname.split('/').pop() ?? ''
+                    )
+                    const entries = extractContentEntries(buf, fallbackName)
+                    if (entries.length === 0) continue
+                    db.transaction(() => {
+                        for (const { sha256, entryName } of entries) {
+                            insertContent.run(sha256)
+                            const { changes } = insertFile.run(
+                                modId,
+                                sha256,
+                                file.id,
+                                mod.version,
+                                new Date().toISOString(),
+                                entryName
+                            )
+                            if (changes > 0) newFiles++
+                            else if (fillEntryName.run(entryName, modId, sha256).changes > 0)
+                                filledNames++
+                        }
+                    })()
+                    indexedFileIds.add(file.id)
+                    missingNameFileIds.delete(file.id)
+                } catch (e) {
+                    errors.push(`${label} mod ${mod.id} file ${file.id}: ${e}`)
+                }
+            }
+
+            progress[label]++
+            if (progress[label] % 50 === 0) printProgress()
+        })
+    }
+
+    const pd3Tasks = buildContentTasks(
+        pd3Mods,
+        pd3SourceId,
+        'pd3',
+        indexedPd3FileIds,
+        missingNamePd3FileIds
+    )
+    const cbTasks = buildContentTasks(cbMods, cbSourceId, 'cb', indexedCbFileIds, missingNameCbFileIds)
 
     // --- PD2 tasks ---
 
     // Writes one PD2 file's entries into the DB. Returns true if anything was stored.
-    const storePd2 = (modId: number, fileId: number, version: string, entries: PakEntry[]) => {
+    const storePd2 = (modId: number, fileId: number, version: string, entries: ContentEntry[]) => {
         if (entries.length === 0) return
         db.transaction(() => {
             for (const { sha256, entryName } of entries) {
@@ -852,7 +918,7 @@ async function main(): Promise<void> {
 
     const pd2Tasks: Task[] = pd2Mods.map((mod) => async () => {
         if (!mod.has_download) {
-            donePd2++
+            progress.pd2++
             return
         }
 
@@ -863,7 +929,7 @@ async function main(): Promise<void> {
         if (mod.download_type === 'file' && mod.download_id != null) {
             const fileId = mod.download_id
             if (indexedPd2FileIds.has(fileId) && !missingNamePd2FileIds.has(fileId)) {
-                donePd2++
+                progress.pd2++
                 return
             }
             try {
@@ -884,7 +950,7 @@ async function main(): Promise<void> {
                 files = await listModFiles(mod.id)
             } catch (e) {
                 errors.push(`pd2 mod ${mod.id}: failed to list files — ${e}`)
-                donePd2++
+                progress.pd2++
                 return
             }
             if (files.length > 0) {
@@ -911,18 +977,13 @@ async function main(): Promise<void> {
             }
         }
 
-        donePd2++
-        if (donePd2 % 200 === 0) {
-            const total = (db.prepare('SELECT COUNT(*) as n FROM files').get() as { n: number }).n
-            console.log(
-                `  [PD3: ${donePd3}/${pd3Mods.length} — PD2: ${donePd2}/${pd2Mods.length} — PDTH: ${donePdth}/${pdthMods.length} — ${total} files indexed]`
-            )
-        }
+        progress.pd2++
+        if (progress.pd2 % 200 === 0) printProgress()
     })
 
     // --- PDTH tasks (same extraction strategy as PD2) ---
 
-    const storePdth = (modId: number, fileId: number, version: string, entries: PakEntry[]) => {
+    const storePdth = (modId: number, fileId: number, version: string, entries: ContentEntry[]) => {
         if (entries.length === 0) return
         db.transaction(() => {
             for (const { sha256, entryName } of entries) {
@@ -945,7 +1006,7 @@ async function main(): Promise<void> {
 
     const pdthTasks: Task[] = pdthMods.map((mod) => async () => {
         if (!mod.has_download) {
-            donePdth++
+            progress.pdth++
             return
         }
 
@@ -954,7 +1015,7 @@ async function main(): Promise<void> {
         if (mod.download_type === 'file' && mod.download_id != null) {
             const fileId = mod.download_id
             if (indexedPdthFileIds.has(fileId) && !missingNamePdthFileIds.has(fileId)) {
-                donePdth++
+                progress.pdth++
                 return
             }
             try {
@@ -973,7 +1034,7 @@ async function main(): Promise<void> {
                 files = await listModFiles(mod.id)
             } catch (e) {
                 errors.push(`pdth mod ${mod.id}: failed to list files — ${e}`)
-                donePdth++
+                progress.pdth++
                 return
             }
             if (files.length > 0) {
@@ -997,19 +1058,14 @@ async function main(): Promise<void> {
             }
         }
 
-        donePdth++
-        if (donePdth % 50 === 0) {
-            const total = (db.prepare('SELECT COUNT(*) as n FROM files').get() as { n: number }).n
-            console.log(
-                `  [PD3: ${donePd3}/${pd3Mods.length} — PD2: ${donePd2}/${pd2Mods.length} — PDTH: ${donePdth}/${pdthMods.length} — ${total} files indexed]`
-            )
-        }
+        progress.pdth++
+        if (progress.pdth % 50 === 0) printProgress()
     })
 
     console.log(
-        `Processing ${pd3Mods.length} PD3 + ${pd2Mods.length} PD2 + ${pdthMods.length} PDTH mods with ${CONCURRENCY} workers...\n`
+        `Processing ${pd3Mods.length} PD3 + ${pd2Mods.length} PD2 + ${pdthMods.length} PDTH + ${cbMods.length} CB mods with ${CONCURRENCY} workers...\n`
     )
-    await runPool([...pd3Tasks, ...pd2Tasks, ...pdthTasks], CONCURRENCY)
+    await runPool([...pd3Tasks, ...pd2Tasks, ...pdthTasks, ...cbTasks], CONCURRENCY)
 
     db.prepare('INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)').run(
         'last_run_at',

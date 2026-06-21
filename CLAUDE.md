@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with th
 
 ## What this is
 
-TypeScript build pipeline that downloads every mod file from modworkshop.net for PD2, PDTH, and PD3, hashes each `.pak` with SHA256, and stores the results in `index.db` (SQLite). The database is published as a GitHub Release asset (`modrexio/modrex-index`, tag `latest-index`) — never committed to git. `modrex-main` downloads it on startup with a 1-hour TTL cached in `app_data_dir()`.
+TypeScript build pipeline that downloads every mod file from modworkshop.net for PD2, PDTH, PD3, and Crime Boss: Rockay City, hashes the relevant content with SHA256, and stores the results in `index.db` (SQLite). The database is published as a GitHub Release asset (`modrexio/modrex-index`, tag `latest-index`) — never committed to git. `modrex-main` downloads it on startup with a 1-hour TTL cached in `app_data_dir()`.
 
 ## Commands
 
@@ -31,17 +31,17 @@ lookup-mod.mjs    ← dev util: look up a mod by SHA256
 ### SQLite schema
 
 ```sql
-games         (id, name, slug)                                      -- "PAYDAY 3"/"pd3", "PAYDAY 2"/"pd2", "PAYDAY: The Heist"/"pdth"
+games         (id, name, slug)                                      -- "PAYDAY 3"/"pd3", "PAYDAY 2"/"pd2", "PAYDAY: The Heist"/"pdth", "Crime Boss: Rockay City"/"cb"
 sources       (id, game_id, name, base_url, game_ref)               -- modworkshop source per game
 mods          (id, source_id, remote_id, name, url)                 -- one row per mod
 file_contents (sha256)                                              -- deduplication; sha256 is PK
-files         (id, mod_id, remote_id, version, sha256, entry_name)  -- one row per .pak file; sha256 FK → file_contents
+files         (id, mod_id, remote_id, version, sha256, entry_name)  -- one row per hashed file; sha256 FK → file_contents
 metadata      (key, value)                                          -- last_run_at timestamp
 ```
 
-`entry_name` is the pak's path inside its archive (forward slashes; the download's filename for bare paks). Rows indexed before the column existed hold `''` — run `pnpm build-index -- --backfill` once to fill them (it re-downloads only files whose rows lack names). `modrex-main` uses it to list a mod's full pak set for the reinstall-missing-files UI.
+`entry_name` is the file's path inside its archive (forward slashes; the download's filename for bare files). Rows indexed before the column existed hold `''` — run `pnpm build-index -- --backfill` once to fill them (it re-downloads only files whose rows lack names). `modrex-main` uses it to list a mod's full pak set for the reinstall-missing-files UI.
 
-`modrex-main` queries via `files → mods → sources → games` filtered by `games.name`. Cross-game isolation is enforced: a PD2 SHA256 never matches a PD3 mod.
+`modrex-main` queries via `files → mods → sources → games` filtered by `games.name`. Cross-game isolation is enforced: a PD2 SHA256 never matches a PD3 mod. The `games.name` string is load-bearing, not cosmetic — it must match `modrex-main`'s `ModEngineConfig.index_game_name` exactly (e.g. Crime Boss's row is `"Crime Boss: Rockay City"`, matching `CRIMEBOSS_ENGINE.index_game_name`).
 
 ### GitHub Actions workflow
 
@@ -54,6 +54,8 @@ The workflow downloads the previous `index.db` from the release before running s
 - _default_ — incremental and **time-windowed**: `listModsSince(lastRunAt)` only examines mods updated since the previous run, and skips files already in `files`.
 - `--backfill` — scans **all** mods (`since = null`), still skipping already-indexed files. **Required after any coverage change** (a new archive format, a new game, or raising `PD2_MAX_FULL_DOWNLOAD_BYTES`): the default run never revisits older mods, so previously-skipped files only get picked up by a backfill.
 - `--repair-versions` — rewrites the `version` column from the listings; no downloads.
+
+PD3 and Crime Boss are both UE pak-based with no marker-file shortcut available, so they share one extraction path (`buildContentTasks`, parameterized per game): the whole archive is downloaded and `extractContentEntries` pulls out every entry matching `CONTENT_EXTENSIONS` (`.pak`, `.ucas`, `.utoc`, `.lua`) — not just `.pak`. `.ucas`/`.utoc` are UE5 IoStore's other two pieces of a mod's cooked content (present for nearly every Crime Boss mod, less often for PD3); `.lua` is a UE4SS Lua sub-mod's script entry point, added so `modrex-main`'s ambient scan can eventually identify standalone UE4SS sub-mods by SHA256 the same way it identifies `.pak` mods. **Known caveat**: `modrex-main`'s `hashable_file_for_mod_dir` picks a Directory-unit mod's representative file via `first_pak_file_in_dir` → `first_file_in_dir` (alphabetically-first file, depth-first) when there's no `.pak`/`main.xml`. For a UE4SS sub-mod shaped exactly like `Scripts/main.lua` with nothing else at the root, that already resolves to the same file this indexer hashes — but a sub-mod with other root-level files/folders sorting before `Scripts` would hash something different on each side, and the SHA256 wouldn't match. This hasn't been fixed on the `modrex-main` side; it's a known partial limitation, not a bug here.
 
 PD2/PDTH mods aren't `.pak` — for them the indexer hashes one representative marker file per mod (`mod.txt` / `main.xml` / wrapper-relative first file via `selectMarkerPath`, chosen to match `modrex-main`'s `first_file_in_dir`). ZIPs use HTTP Range to fetch only that file; RAR/7z have no such trick, so they're fully downloaded and gated by `PD2_MAX_FULL_DOWNLOAD_BYTES` (50 MB) — larger ones are skipped. This is what lets `modrex-main` identify marker-less asset/background packs (incl. recovered host packs) by SHA256.
 
