@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with th
 
 ## What this is
 
-TypeScript build pipeline that downloads every mod file from modworkshop.net for PD2, PDTH, PD3, and Crime Boss: Rockay City, hashes the relevant content with SHA256, and stores the results in `index.db` (SQLite). The database is published as a GitHub Release asset (`modrexio/modrex-index`, tag `latest-index`) — never committed to git. `modrex-main` downloads it on startup with a 1-hour TTL cached in `app_data_dir()`.
+TypeScript build pipeline that downloads every mod file from modworkshop.net for PD2, PDTH, PD3, and Crime Boss: Rockay City, hashes the relevant content with SHA256, and stores the results in `index.db` (SQLite). The database is published as a GitHub Release asset (`modrexio/modrex-index`, tag `latest-index`) — never committed to git. A tiny `index-stats.json` asset is published beside it for website counters. `modrex-main` downloads `index.db` on startup with a 1-hour TTL cached in `app_data_dir()`.
 
 ## Commands
 
@@ -45,7 +45,7 @@ metadata      (key, value)                                          -- last_run_
 
 ### GitHub Actions workflow
 
-Triggered via `workflow_dispatch` (no built-in cron). Hashes mod files from modworkshop, writes `index.db`, uploads as a release asset to the `latest-index` tag (always overwrites — one tag, one asset, consumers always hit the same URL).
+Triggered via `workflow_dispatch` (no built-in cron). Hashes mod files from modworkshop, writes `index.db` and `index-stats.json`, uploads both as release assets to the `latest-index` tag (always overwrites — one tag, consumers always hit the same URLs).
 
 The workflow downloads the previous `index.db` from the release before running so the build is incremental. Download is retried up to 5× with an integrity check (`PRAGMA integrity_check`) because the release CDN can briefly serve a stale copy after an asset is replaced. Concurrent runs are queued, not cancelled (`cancel-in-progress: false`), to avoid splitting the shared 90 req/min API budget.
 

@@ -31,6 +31,7 @@ const PDTH_GAME_ID = 2
 const CRIMEBOSS_GAME_ID = 857
 const USER_AGENT = 'modrex-indexer/1.0'
 const DB_PATH = join(import.meta.dirname, 'index.db')
+const STATS_PATH = join(import.meta.dirname, 'index-stats.json')
 // Faster than full_rebuild when adding a new format: only unindexed files are downloaded.
 const BACKFILL = process.argv.includes('--backfill')
 // Patches only the version column on existing rows from the listings — no downloads, no
@@ -77,6 +78,17 @@ interface Paginated<T> {
     data: T[]
     meta: { current_page: number; last_page: number }
 }
+
+interface IndexStats {
+    supportedMods: number
+    generatedAt: string
+}
+
+const SUPPORTED_MODS_SQL = `
+    SELECT COUNT(DISTINCT m.id) AS supported_mods
+    FROM mods m
+    JOIN files f ON f.mod_id = m.id
+`
 
 // --- schema ---
 
@@ -186,6 +198,16 @@ function openDb(): {
         pdthSourceId: pdthSource.id,
         cbSourceId: cbSource.id,
     }
+}
+
+function writeIndexStats(db: DB): IndexStats {
+    const row = db.prepare(SUPPORTED_MODS_SQL).get() as { supported_mods: number }
+    const stats: IndexStats = {
+        supportedMods: row.supported_mods,
+        generatedAt: new Date().toISOString(),
+    }
+    writeFileSync(STATS_PATH, `${JSON.stringify(stats, null, 2)}\n`)
+    return stats
 }
 
 // Scope indexed file IDs to a specific source so PD2 and PD3 remote_ids never collide.
@@ -816,6 +838,8 @@ async function main(): Promise<void> {
         repair(pdthMods, pdthSourceId)
         repair(cbMods, cbSourceId)
         console.log(`\nVersion repair: rewrote ${fixed} file version(s).`)
+        const stats = writeIndexStats(db)
+        console.log(`Wrote index-stats.json (${stats.supportedMods} supported mods).`)
         db.close()
         process.exit(fixed > 0 ? 0 : 2)
     }
@@ -1112,9 +1136,11 @@ async function main(): Promise<void> {
     )
 
     const total = (db.prepare('SELECT COUNT(*) as n FROM files').get() as { n: number }).n
+    const stats = writeIndexStats(db)
     console.log(
         `\nDone. ${total} files in index.db (${newFiles} new, ${filledNames} names filled this run)`
     )
+    console.log(`Wrote index-stats.json (${stats.supportedMods} supported mods).`)
 
     if (errors.length > 0) {
         console.log(`\n${errors.length} errors:`)

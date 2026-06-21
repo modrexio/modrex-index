@@ -104,3 +104,10 @@ jobs:
             gh release create latest-index index.db \
               --title "Latest mod index" \
               --notes "Auto-updated PD2 + PD3 mod hash index for modrex."
+
+      - name: Upload index stats
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          test -f index-stats.json
+          gh release upload latest-index index-stats.json --clobber
