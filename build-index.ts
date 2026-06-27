@@ -20,7 +20,7 @@ import AdmZip from 'adm-zip'
 import { createHash } from 'crypto'
 import { inflateRawSync } from 'zlib'
 import { join } from 'path'
-import { mkdtempSync, rmSync, readdirSync, readFileSync, statSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, readdirSync, readFileSync, statSync, writeFileSync } from 'fs'
 import { execFileSync } from 'child_process'
 import { tmpdir } from 'os'
 
@@ -668,6 +668,125 @@ async function extractPd2FromFull(url: string, type: string): Promise<ContentEnt
     }
 }
 
+// --- pdmod support ---
+
+const PDMOD_PASSWORD = `0$45'5))66S2ixF51a<6}L2UK`
+const PDMOD_HASHLIST_PATH = join(import.meta.dirname, 'pdmod_hashlist.txt')
+
+// Bob Jenkins lookup8 — port of hash.cpp from HW12Dev/PDModExtractor (MIT).
+function mix64(a: bigint, b: bigint, c: bigint): [bigint, bigint, bigint] {
+    const M = 0xffffffffffffffffn
+    a = (a - b - c ^ (c >> 43n)) & M
+    b = (b - c - a ^ (a << 9n)) & M
+    c = (c - a - b ^ (b >> 8n)) & M
+    a = (a - b - c ^ (c >> 38n)) & M
+    b = (b - c - a ^ (a << 23n)) & M
+    c = (c - a - b ^ (b >> 5n)) & M
+    a = (a - b - c ^ (c >> 35n)) & M
+    b = (b - c - a ^ (a << 49n)) & M
+    c = (c - a - b ^ (b >> 11n)) & M
+    a = (a - b - c ^ (c >> 12n)) & M
+    b = (b - c - a ^ (a << 18n)) & M
+    c = (c - a - b ^ (b >> 22n)) & M
+    return [a, b, c]
+}
+
+function hash64(s: string): bigint {
+    const k = Buffer.from(s, 'utf-8')
+    const M = 0xffffffffffffffffn
+    const length = BigInt(k.length)
+    let a = 0n, b = 0n, c = 0x9e3779b97f4a7c13n
+    let pos = 0
+    while (pos + 24 <= k.length) {
+        a = (a + k.readBigUInt64LE(pos + 0)) & M
+        b = (b + k.readBigUInt64LE(pos + 8)) & M
+        c = (c + k.readBigUInt64LE(pos + 16)) & M
+        ;[a, b, c] = mix64(a, b, c)
+        pos += 24
+    }
+    const g = (i: number): bigint => (pos + i < k.length ? BigInt(k[pos + i]) : 0n)
+    c = (c + length) & M
+    a = (a + (g(0) | g(1)<<8n | g(2)<<16n | g(3)<<24n | g(4)<<32n | g(5)<<40n | g(6)<<48n | g(7)<<56n)) & M
+    b = (b + (g(8) | g(9)<<8n | g(10)<<16n | g(11)<<24n | g(12)<<32n | g(13)<<40n | g(14)<<48n | g(15)<<56n)) & M
+    c = (c + (g(16) | g(17)<<8n | g(18)<<16n | g(19)<<24n | g(20)<<32n | g(21)<<40n | g(22)<<56n)) & M
+    ;[, , c] = mix64(a, b, c)
+    return c
+}
+
+let pdmodHashlistCache: Map<bigint, string> | null = null
+
+function pdmodHashlist(): Map<bigint, string> {
+    if (!pdmodHashlistCache) {
+        pdmodHashlistCache = new Map()
+        for (const line of readFileSync(PDMOD_HASHLIST_PATH, 'utf-8').split('\n')) {
+            const s = line.trim()
+            if (s) pdmodHashlistCache.set(hash64(s), s)
+        }
+    }
+    return pdmodHashlistCache
+}
+
+interface PdmodItem {
+    // Stored as strings after large-integer-safe JSON parsing (see parsePdmodManifest).
+    BundlePath: string
+    BundleExtension: string
+    ReplacementFile: string
+}
+
+async function extractPdmodEntry(url: string): Promise<ContentEntry | null> {
+    const buf = await downloadBuffer(url)
+    const tmp = mkdtempSync(join(tmpdir(), 'modrex-pdmod-'))
+    try {
+        const archive = join(tmp, 'archive.pdmod')
+        const outDir = join(tmp, 'out')
+        mkdirSync(outDir)
+        writeFileSync(archive, buf)
+
+        try {
+            execFileSync('7z', ['x', archive, `-p${PDMOD_PASSWORD}`, '-o' + outDir, '-y'], {
+                stdio: 'ignore',
+            })
+        } catch {
+            return null
+        }
+
+        const manifestPath = join(outDir, 'pdmod.json')
+        if (!existsSync(manifestPath)) return null
+
+        // BundlePath/BundleExtension are uint64 — quote them before JSON.parse to avoid
+        // float64 truncation (values exceed Number.MAX_SAFE_INTEGER = 2^53 − 1).
+        const raw = readFileSync(manifestPath, 'utf-8').replace(
+            /("BundlePath"|"BundleExtension"):\s*(\d+)/g,
+            (_m, key: string, num: string) => `${key}: "${num}"`
+        )
+        const manifest = JSON.parse(raw) as { ItemQueue: PdmodItem[] }
+
+        const hl = pdmodHashlist()
+        const resolved: Array<{ path: string; repl: string }> = []
+        for (const item of manifest.ItemQueue) {
+            const name = hl.get(BigInt(item.BundlePath))
+            const ext = hl.get(BigInt(item.BundleExtension))
+            if (name && ext) resolved.push({ path: `${name}.${ext}`, repl: item.ReplacementFile })
+        }
+        if (resolved.length === 0) return null
+
+        // Sort alphabetically — matches modrex-main's first_file_in_dir representative-file pick.
+        resolved.sort((a, b) => a.path.localeCompare(b.path))
+
+        const first = resolved[0]
+        const replPath = join(outDir, first.repl)
+        if (!existsSync(replPath)) return null
+
+        const content = readFileSync(replPath)
+        return {
+            sha256: createHash('sha256').update(content).digest('hex'),
+            entryName: first.path,
+        }
+    } finally {
+        rmSync(tmp, { recursive: true, force: true })
+    }
+}
+
 // Resolves a listing download_id to its CDN URL (+ size) with a single throttled api
 // hit; the 302 follows through to unmetered storage.modworkshop.net for the actual bytes.
 async function resolveDownload(
@@ -731,6 +850,7 @@ function shouldDownload(type: string): boolean {
         t.includes('zip') ||
         t.includes('7z') ||
         t.includes('rar') ||
+        t === 'pdmod' ||
         t === 'application/octet-stream' ||
         t === 'application/zip' ||
         t === ''
@@ -1086,7 +1206,11 @@ async function main(): Promise<void> {
                 if (resolved) {
                     insertMod.run(pdthSourceId, mod.id, mod.name, modUrl)
                     const { id: modId } = getModId.get(pdthSourceId, mod.id) as { id: number }
-                    storePdth(modId, fileId, mod.version, await extractPd2Entries(resolved.url, resolved.size))
+                    const isPdmod = resolved.url.split('?')[0].toLowerCase().endsWith('.pdmod')
+                    const entries = isPdmod
+                        ? await extractPdmodEntry(resolved.url).then((e) => (e ? [e] : []))
+                        : await extractPd2Entries(resolved.url, resolved.size)
+                    storePdth(modId, fileId, mod.version, entries)
                 }
             } catch (e) {
                 errors.push(`pdth mod ${mod.id} file ${fileId}: ${e}`)
@@ -1108,12 +1232,13 @@ async function main(): Promise<void> {
                         continue
                     }
                     try {
-                        storePdth(
-                            modId,
-                            file.id,
-                            file.version || mod.version,
-                            await extractPd2Entries(file.download_url, null)
-                        )
+                        const entries =
+                            file.type === 'pdmod'
+                                ? await extractPdmodEntry(file.download_url).then((e) =>
+                                      e ? [e] : []
+                                  )
+                                : await extractPd2Entries(file.download_url, null)
+                        storePdth(modId, file.id, file.version || mod.version, entries)
                     } catch (e) {
                         errors.push(`pdth mod ${mod.id} file ${file.id}: ${e}`)
                     }
