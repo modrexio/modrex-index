@@ -19,6 +19,8 @@ node lookup-mod.mjs <name-or-id>        # Look up a mod by name or remote_id (re
 
 > The three `*.mjs` dev utils hardcode a path to the installed app's cached DB (`C:/Users/oleh/AppData/…`). To query a freshly built `index.db` instead, edit the `APP_DB` constant at the top of each file.
 
+`7z` must be on `PATH` — used for 7z and RAR extraction and `.pdmod` decryption. Windows: install from 7-zip.org. Ubuntu CI: `sudo apt-get install p7zip-full` (required for RAR support).
+
 ## Architecture
 
 ```
@@ -49,6 +51,8 @@ Triggered via `workflow_dispatch` (no built-in cron). Hashes mod files from modw
 
 The workflow downloads the previous `index.db` from the release before running so the build is incremental. Download is retried up to 5× with an integrity check (`PRAGMA integrity_check`) because the release CDN can briefly serve a stale copy after an asset is replaced. Concurrent runs are queued, not cancelled (`cancel-in-progress: false`), to avoid splitting the shared 90 req/min API budget.
 
+Exit code `2` means "nothing new — skip upload"; the workflow gates the release-asset upload on exit code `0`. Exit `1` means an unhandled error.
+
 **Run modes** (`workflow_dispatch` inputs / CLI flags):
 
 - _default_ — incremental and **time-windowed**: `listModsSince(lastRunAt)` only examines mods updated since the previous run, and skips files already in `files`.
@@ -60,6 +64,8 @@ PD3 and Crime Boss are both UE pak-based with no marker-file shortcut available,
 `detectFormat` also recognizes RAR by magic bytes (`Rar!\x1a\x07`) for this path — found missing after a live backfill showed several real Crime Boss mods (e.g. character cosmetic mods distributed as `.rar`) silently produced zero indexed files: `shouldDownload` didn't recognize the `"rar"` modworkshop file type at all, so the file was skipped before download ever started. Both gaps are fixed (`shouldDownload` now includes `rar`; the RAR branch shells out to the same `7z` CLI `extractPd2FromFull` already uses for PD2/PDTH, extracting everything and filtering by `CONTENT_EXTENSIONS` in JS rather than relying on 7z's RAR mask support, which is less reliable than for zip/7z). **Verify after the next backfill**: a real RAR-only mod (e.g. modworkshop id `56889`, "Hideo Kojima") should go from 0 indexed files to its expected count.
 
 PD2/PDTH mods aren't `.pak` — for them the indexer hashes one representative marker file per mod (`mod.txt` / `main.xml` / wrapper-relative first file via `selectMarkerPath`, chosen to match `modrex-main`'s `first_file_in_dir`). ZIPs use HTTP Range to fetch only that file; RAR/7z have no such trick, so they're fully downloaded and gated by `PD2_MAX_FULL_DOWNLOAD_BYTES` (50 MB) — larger ones are skipped. This is what lets `modrex-main` identify marker-less asset/background packs (incl. recovered host packs) by SHA256.
+
+PDTH additionally handles `.pdmod` files: decrypted via `7z` with a hardcoded password, then the `pdmod.json` manifest's `BundlePath`/`BundleExtension` uint64 fields are resolved against `pdmod_hashlist.txt` (committed, 130k entries, Bob Jenkins lookup8) to recover asset paths — the alphabetically-first resolved path's replacement file is hashed. `pdmod_hashlist.txt` must stay committed; without it all `.pdmod` mods produce zero indexed files.
 
 ## Rules
 
