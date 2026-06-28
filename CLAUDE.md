@@ -67,6 +67,13 @@ PD2/PDTH mods aren't `.pak` — for them the indexer hashes one representative m
 
 PDTH additionally handles `.pdmod` files: decrypted via `7z` with a hardcoded password, then the `pdmod.json` manifest's `BundlePath`/`BundleExtension` uint64 fields are resolved against `pdmod_hashlist.txt` (committed, 130k entries, Bob Jenkins lookup8) to recover asset paths — the alphabetically-first resolved path's replacement file is hashed. `pdmod_hashlist.txt` must stay committed; without it all `.pdmod` mods produce zero indexed files.
 
+## Agent skills
+
+Reusable skills live in `.agents/skills/` at the workspace root. Available as Claude Code slash commands:
+
+- `/commit` — read the current diff and propose a conventional commit message; waits for confirmation before committing.
+- `/deslop` — audit the diff for AI-generated slop and fix each issue found.
+
 ## Rules
 
 - Commit messages must follow conventional commits: `type(scope): subject`
