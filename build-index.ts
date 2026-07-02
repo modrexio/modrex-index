@@ -20,7 +20,7 @@ import AdmZip from 'adm-zip'
 import { createHash } from 'crypto'
 import { inflateRawSync } from 'zlib'
 import { join } from 'path'
-import { existsSync, mkdirSync, mkdtempSync, rmSync, readdirSync, readFileSync, statSync, writeFileSync } from 'fs'
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, readdirSync, readFileSync, statSync, writeFileSync } from 'fs'
 import { execFileSync } from 'child_process'
 import { tmpdir } from 'os'
 
@@ -51,6 +51,46 @@ let apiNextSlot = 0
 // per-file CI cost; downloads are incremental so raising it drains the newly-eligible backlog
 // over successive hourly runs. 50 MB covers most asset/background packs (e.g. menu backgrounds).
 const PD2_MAX_FULL_DOWNLOAD_BYTES = 50 * 1_024 * 1_024
+
+// --- run metrics ---
+
+// Runtime is dominated by throttled API calls (~706 ms each, serialized across all
+// workers), so the call count is the number that explains a slow run. Storage
+// requests are unmetered and parallel — tracked to show where download time went.
+const metrics = {
+    apiCalls: 0,
+    storageRequests: 0,
+    storageBytes: 0,
+    phases: [] as { name: string; seconds: number }[],
+}
+
+function timePhase<T>(name: string, run: () => Promise<T>): Promise<T> {
+    const start = Date.now()
+    return run().finally(() => {
+        metrics.phases.push({ name, seconds: Math.round((Date.now() - start) / 1000) })
+    })
+}
+
+function writeRunSummary(mode: string, newFiles: number, filledNames: number, errorCount: number): void {
+    const phases = metrics.phases.map((p) => `${p.name} ${p.seconds}s`).join(', ')
+    const mb = (metrics.storageBytes / 1_048_576).toFixed(0)
+    const text =
+        `Run summary (${mode}): ${metrics.apiCalls} API calls, ` +
+        `${metrics.storageRequests} storage requests (${mb} MB), ` +
+        `${newFiles} new files, ${filledNames} names filled, ${errorCount} errors\n` +
+        `Phases: ${phases}`
+    console.log(`\n${text}`)
+    if (process.env.GITHUB_STEP_SUMMARY) {
+        appendFileSync(
+            process.env.GITHUB_STEP_SUMMARY,
+            `### Index build (${mode})\n\n` +
+                `| API calls | Storage requests | Downloaded | New files | Names filled | Errors |\n` +
+                `|---|---|---|---|---|---|\n` +
+                `| ${metrics.apiCalls} | ${metrics.storageRequests} | ${mb} MB | ${newFiles} | ${filledNames} | ${errorCount} |\n\n` +
+                `Phases: ${phases}\n`
+        )
+    }
+}
 
 // --- types ---
 
@@ -244,6 +284,7 @@ function getIndexedModIds(db: DB, sourceId: number): Set<number> {
 
 // Reserve the next api.modworkshop.net slot, spacing calls to stay under the 90/min cap.
 async function apiThrottle(): Promise<void> {
+    metrics.apiCalls++
     const now = Date.now()
     const slot = Math.max(now, apiNextSlot)
     apiNextSlot = slot + API_MIN_INTERVAL_MS
@@ -336,12 +377,15 @@ async function listModFiles(modId: number): Promise<ModFile[]> {
 // --- PD3 download + extraction ---
 
 async function downloadBuffer(downloadUrl: string): Promise<Buffer> {
+    metrics.storageRequests++
     const res = await fetch(downloadUrl, {
         headers: { 'User-Agent': USER_AGENT },
         signal: AbortSignal.timeout(120_000),
     })
     if (!res.ok) throw new Error(`download ${res.status}`)
-    return Buffer.from(await res.arrayBuffer())
+    const buf = Buffer.from(await res.arrayBuffer())
+    metrics.storageBytes += buf.length
+    return buf
 }
 
 function detectFormat(buf: Buffer): 'zip' | '7z' | 'rar' | 'pak' {
@@ -478,6 +522,7 @@ interface CdEntry {
 }
 
 async function headContentLength(url: string): Promise<number | null> {
+    metrics.storageRequests++
     const res = await fetch(url, {
         method: 'HEAD',
         headers: { 'User-Agent': USER_AGENT },
@@ -491,6 +536,7 @@ async function headContentLength(url: string): Promise<number | null> {
 }
 
 async function rangeGet(url: string, start: number, end: number): Promise<Buffer> {
+    metrics.storageRequests++
     const res = await fetch(url, {
         headers: { 'User-Agent': USER_AGENT, Range: `bytes=${start}-${end}` },
         signal: AbortSignal.timeout(60_000),
@@ -498,7 +544,9 @@ async function rangeGet(url: string, start: number, end: number): Promise<Buffer
     })
     // 200 means the server ignored Range and returned everything (still usable)
     if (res.status !== 206 && res.status !== 200) throw new Error(`rangeGet ${res.status}`)
-    return Buffer.from(await res.arrayBuffer())
+    const buf = Buffer.from(await res.arrayBuffer())
+    metrics.storageBytes += buf.length
+    return buf
 }
 
 function findEocd(buf: Buffer): { cdOffset: number; cdSize: number } | null {
@@ -922,21 +970,24 @@ async function main(): Promise<void> {
     // Fetch both mod lists before building tasks so closures can reference both lengths.
     // Repair scans every mod (since = null) so it can correct any stale version.
     const since = BACKFILL || REPAIR_VERSIONS ? null : lastRunAt
-    console.log('Fetching PD3 mod list...')
-    const pd3Mods = await listModsSince(PD3_GAME_ID, since)
-    console.log(`  ${pd3Mods.length} PD3 mods to process\n`)
+    const { pd3Mods, pd2Mods, pdthMods, cbMods } = await timePhase('listing', async () => {
+        console.log('Fetching PD3 mod list...')
+        const pd3Mods = await listModsSince(PD3_GAME_ID, since)
+        console.log(`  ${pd3Mods.length} PD3 mods to process\n`)
 
-    console.log('Fetching PD2 mod list...')
-    const pd2Mods = await listModsSince(PD2_GAME_ID, since)
-    console.log(`  ${pd2Mods.length} PD2 mods to process\n`)
+        console.log('Fetching PD2 mod list...')
+        const pd2Mods = await listModsSince(PD2_GAME_ID, since)
+        console.log(`  ${pd2Mods.length} PD2 mods to process\n`)
 
-    console.log('Fetching PDTH mod list...')
-    const pdthMods = await listModsSince(PDTH_GAME_ID, since)
-    console.log(`  ${pdthMods.length} PDTH mods to process\n`)
+        console.log('Fetching PDTH mod list...')
+        const pdthMods = await listModsSince(PDTH_GAME_ID, since)
+        console.log(`  ${pdthMods.length} PDTH mods to process\n`)
 
-    console.log('Fetching Crime Boss mod list...')
-    const cbMods = await listModsSince(CRIMEBOSS_GAME_ID, since)
-    console.log(`  ${cbMods.length} Crime Boss mods to process\n`)
+        console.log('Fetching Crime Boss mod list...')
+        const cbMods = await listModsSince(CRIMEBOSS_GAME_ID, since)
+        console.log(`  ${cbMods.length} Crime Boss mods to process\n`)
+        return { pd3Mods, pd2Mods, pdthMods, cbMods }
+    })
 
     // Version-only repair: rewrite the version column on already-indexed files from the
     // listing's mod.version, then exit. No downloads — turns a 3-hour backfill into minutes.
@@ -960,6 +1011,7 @@ async function main(): Promise<void> {
         console.log(`\nVersion repair: rewrote ${fixed} file version(s).`)
         const stats = writeIndexStats(db)
         console.log(`Wrote index-stats.json (${stats.supportedMods} supported mods).`)
+        writeRunSummary('repair-versions', 0, 0, 0)
         db.close()
         process.exit(fixed > 0 ? 0 : 2)
     }
@@ -1253,7 +1305,9 @@ async function main(): Promise<void> {
     console.log(
         `Processing ${pd3Mods.length} PD3 + ${pd2Mods.length} PD2 + ${pdthMods.length} PDTH + ${cbMods.length} CB mods with ${CONCURRENCY} workers...\n`
     )
-    await runPool([...pd3Tasks, ...pd2Tasks, ...pdthTasks, ...cbTasks], CONCURRENCY)
+    await timePhase('processing', () =>
+        runPool([...pd3Tasks, ...pd2Tasks, ...pdthTasks, ...cbTasks], CONCURRENCY)
+    )
 
     db.prepare('INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)').run(
         'last_run_at',
@@ -1271,6 +1325,8 @@ async function main(): Promise<void> {
         console.log(`\n${errors.length} errors:`)
         errors.forEach((e) => console.log(`  - ${e}`))
     }
+
+    writeRunSummary(BACKFILL ? 'backfill' : 'incremental', newFiles, filledNames, errors.length)
 
     db.close()
 
