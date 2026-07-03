@@ -85,15 +85,17 @@ jobs:
             exit 1
           fi
 
-      - name: Download builder state
+      - name: Download builder state and previous stats
         if: ${{ !inputs.full_rebuild }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Best-effort, unlike index.db: builder-state.db only *accelerates* the build
-          # (per-mod check state). Missing or corrupt state degrades to a full recheck,
-          # never to wrong index content — so don't retry and never fail the job over it.
-          rm -f builder-state.db builder-state.db-wal builder-state.db-shm
+          # (per-mod check state), and index-stats.json only carries the incremental
+          # window (lastRunAt) across no-op runs. Missing or corrupt copies degrade to a
+          # full recheck / the DB's own last_run_at, never to wrong index content — so
+          # don't retry and never fail the job over either.
+          rm -f builder-state.db builder-state.db-wal builder-state.db-shm index-stats.json
           aid=$(gh api "repos/${{ github.repository }}/releases/tags/latest-index" --jq '.assets[] | select(.name=="builder-state.db") | .id' 2>/dev/null)
           if [ -n "$aid" ]; then
             gh api -H "Accept: application/octet-stream" "repos/${{ github.repository }}/releases/assets/$aid" > builder-state.db 2>/dev/null || true
@@ -101,6 +103,10 @@ jobs:
           if [ -f builder-state.db ] && ! node -e "const d=new(require('better-sqlite3'))('builder-state.db',{readonly:true});const ok=d.pragma('integrity_check',{simple:true})==='ok';d.close();process.exit(ok?0:1)" 2>/dev/null; then
             echo "builder-state.db corrupt — starting with fresh state"
             rm -f builder-state.db
+          fi
+          sid=$(gh api "repos/${{ github.repository }}/releases/tags/latest-index" --jq '.assets[] | select(.name=="index-stats.json") | .id' 2>/dev/null)
+          if [ -n "$sid" ]; then
+            gh api -H "Accept: application/octet-stream" "repos/${{ github.repository }}/releases/assets/$sid" > index-stats.json 2>/dev/null || true
           fi
 
       - name: Run indexer

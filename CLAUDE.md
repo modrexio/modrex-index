@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with th
 
 ## What this is
 
-TypeScript build pipeline that downloads every mod file from modworkshop.net for PD2, PDTH, PD3, and Crime Boss: Rockay City, hashes the relevant content with SHA256, and stores the results in `index.db` (SQLite). The database is published as a GitHub Release asset (`modrexio/modrex-index`, tag `latest-index`) — never committed to git. A tiny `index-stats.json` asset is published beside it for website counters. `modrex-main` downloads `index.db` on startup with a 1-hour TTL cached in `app_data_dir()`.
+TypeScript build pipeline that downloads every mod file from modworkshop.net for PD2, PDTH, PD3, and Crime Boss: Rockay City, hashes the relevant content with SHA256, and stores the results in `index.db` (SQLite). The database is published as a GitHub Release asset (`modrexio/modrex-index`, tag `latest-index`) — never committed to git. A tiny `index-stats.json` asset is published beside it for website counters; it also carries `lastRunAt` — the incremental window — because it's uploaded on every run, unlike `index.db` (a no-op exit-2 run skips the DB upload, so the DB's own `last_run_at` metadata can be stale; the indexer takes the later of the two at startup). `modrex-main` downloads `index.db` on startup with a 1-hour TTL cached in `app_data_dir()`.
 
 ## Commands
 

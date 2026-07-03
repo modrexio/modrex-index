@@ -132,6 +132,11 @@ interface Paginated<T> {
 interface IndexStats {
     supportedMods: number
     generatedAt: string
+    // The incremental window, carried here because index-stats.json is uploaded on every
+    // run, a no-op run skips the index.db upload and would otherwise lose the
+    // advanced last_run_at written into the discarded DB, re-scanning the same window
+    // (and re-downloading its zero-yield mods) until some other mod triggered an upload.
+    lastRunAt: string | null
 }
 
 const SUPPORTED_MODS_SQL = `
@@ -301,14 +306,26 @@ function checkIsCurrent(
     return check.fileIds.every((id) => indexedFileIds.has(id) && !missingNameFileIds.has(id))
 }
 
-function writeIndexStats(db: DB): IndexStats {
+function writeIndexStats(db: DB, lastRunAt: string | null): IndexStats {
     const row = db.prepare(SUPPORTED_MODS_SQL).get() as { supported_mods: number }
     const stats: IndexStats = {
         supportedMods: row.supported_mods,
         generatedAt: new Date().toISOString(),
+        lastRunAt,
     }
     writeFileSync(STATS_PATH, `${JSON.stringify(stats, null, 2)}\n`)
     return stats
+}
+
+function readPreviousLastRunAt(): Date | null {
+    if (!existsSync(STATS_PATH)) return null
+    try {
+        const raw = JSON.parse(readFileSync(STATS_PATH, 'utf-8')) as { lastRunAt?: string | null }
+        return raw.lastRunAt ? new Date(raw.lastRunAt) : null
+    } catch (e) {
+        console.warn(`  [stats] previous index-stats.json unreadable (${e}) — using DB last_run_at`)
+        return null
+    }
 }
 
 // Scope indexed file IDs to a specific source so PD2 and PD3 remote_ids never collide.
@@ -1014,7 +1031,16 @@ async function main(): Promise<void> {
     const lastRunRow = db.prepare('SELECT value FROM metadata WHERE key = ?').get('last_run_at') as
         | { value: string }
         | undefined
-    const lastRunAt = lastRunRow ? new Date(lastRunRow.value) : null
+    const dbLastRunAt = lastRunRow ? new Date(lastRunRow.value) : null
+    // The stats copy is newer whenever the previous run exited 2 (its index.db upload was
+    // skipped, so the DB's metadata is stale) — take whichever timestamp is later.
+    const statsLastRunAt = readPreviousLastRunAt()
+    const lastRunAt =
+        dbLastRunAt && statsLastRunAt
+            ? dbLastRunAt > statsLastRunAt
+                ? dbLastRunAt
+                : statsLastRunAt
+            : (dbLastRunAt ?? statsLastRunAt)
 
     if (BACKFILL) {
         console.log('  Backfill mode — scanning all mods, skipping already-indexed files\n')
@@ -1085,7 +1111,8 @@ async function main(): Promise<void> {
         repair(pdthMods, pdthSourceId)
         repair(cbMods, cbSourceId)
         console.log(`\nVersion repair: rewrote ${fixed} file version(s).`)
-        const stats = writeIndexStats(db)
+        // Repair scans with since = null and must not move the incremental window.
+        const stats = writeIndexStats(db, lastRunAt?.toISOString() ?? null)
         console.log(`Wrote index-stats.json (${stats.supportedMods} supported mods).`)
         writeRunSummary('repair-versions', 0, 0, 0)
         db.close()
@@ -1448,7 +1475,7 @@ async function main(): Promise<void> {
     )
 
     const total = (db.prepare('SELECT COUNT(*) as n FROM files').get() as { n: number }).n
-    const stats = writeIndexStats(db)
+    const stats = writeIndexStats(db, runStartedAt.toISOString())
     console.log(
         `\nDone. ${total} files in index.db (${newFiles} new, ${filledNames} names filled this run)`
     )
