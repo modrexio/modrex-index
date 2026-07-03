@@ -1175,13 +1175,27 @@ async function main(): Promise<void> {
             }
 
             const modUrl = `https://modworkshop.net/mod/${mod.id}`
-            insertMod.run(sourceId, mod.id, mod.name, modUrl)
-            const { id: modId } = getModId.get(sourceId, mod.id) as { id: number }
+            // Insert the mods row lazily, only once a file is actually about to be
+            // written (ensureModId). A mod that yields no indexable content must never
+            // become a childless mods row: modrex-main's query_by_name matches mods
+            // without joining files, so a childless row corrupts name-based
+            // identification (a false match, or a false ambiguity that hides a real one).
+            let modIdCache: number | null =
+                (getModId.get(sourceId, mod.id) as { id: number } | undefined)?.id ?? null
+            const ensureModId = (): number => {
+                if (modIdCache === null) {
+                    insertMod.run(sourceId, mod.id, mod.name, modUrl)
+                    modIdCache = (getModId.get(sourceId, mod.id) as { id: number }).id
+                }
+                return modIdCache
+            }
 
-            if (BACKFILL && mod.version) {
+            // Backfill re-stamps existing files' versions from the listing; only runs when
+            // the mod already has a row (a brand-new mod has no files to re-stamp yet).
+            if (BACKFILL && mod.version && modIdCache !== null) {
                 db.prepare('UPDATE files SET version = ? WHERE mod_id = ? AND version != ?').run(
                     mod.version,
-                    modId,
+                    modIdCache,
                     mod.version
                 )
             }
@@ -1209,6 +1223,7 @@ async function main(): Promise<void> {
                     )
                     const entries = extractContentEntries(buf, fallbackName)
                     if (entries.length === 0) continue
+                    const modId = ensureModId()
                     db.transaction(() => {
                         for (const { sha256, entryName } of entries) {
                             insertContent.run(sha256)
@@ -1311,10 +1326,14 @@ async function main(): Promise<void> {
             try {
                 const resolved = await resolveDownload(fileId)
                 if (resolved) {
-                    insertMod.run(pd2SourceId, mod.id, mod.name, modUrl)
-                    const { id: modId } = getModId.get(pd2SourceId, mod.id) as { id: number }
                     const entries = await extractPd2Entries(resolved.url, resolved.size)
-                    storePd2(modId, fileId, mod.version, entries)
+                    // Insert the mods row only when there's content to store, so a resolved
+                    // download that yields no marker file doesn't leave a childless row.
+                    if (entries.length > 0) {
+                        insertMod.run(pd2SourceId, mod.id, mod.name, modUrl)
+                        const { id: modId } = getModId.get(pd2SourceId, mod.id) as { id: number }
+                        storePd2(modId, fileId, mod.version, entries)
+                    }
                     putCheck(pd2SourceId, mod.id, mod.updated_at, entries.length > 0 ? [fileId] : [])
                 }
             } catch (e) {
@@ -1333,25 +1352,34 @@ async function main(): Promise<void> {
             }
             let failed = false
             const yieldedIds: number[] = []
-            if (files.length > 0) {
-                insertMod.run(pd2SourceId, mod.id, mod.name, modUrl)
-                const { id: modId } = getModId.get(pd2SourceId, mod.id) as { id: number }
-                for (const file of files) {
-                    if (indexedPd2FileIds.has(file.id) && !missingNamePd2FileIds.has(file.id)) {
+            // Insert the mods row lazily on the first stored file, so a mod whose files
+            // all yield nothing doesn't become a childless mods row (see buildContentTasks).
+            let modIdCache: number | null =
+                (getModId.get(pd2SourceId, mod.id) as { id: number } | undefined)?.id ?? null
+            const ensureModId = (): number => {
+                if (modIdCache === null) {
+                    insertMod.run(pd2SourceId, mod.id, mod.name, modUrl)
+                    modIdCache = (getModId.get(pd2SourceId, mod.id) as { id: number }).id
+                }
+                return modIdCache
+            }
+            for (const file of files) {
+                if (indexedPd2FileIds.has(file.id) && !missingNamePd2FileIds.has(file.id)) {
+                    yieldedIds.push(file.id)
+                    continue
+                }
+                try {
+                    // file.download_url is already a storage URL, extract directly.
+                    // Use the mod-level version (the per-file one is usually blank for PD2);
+                    // modrex-main compares installs against the mod version for updates.
+                    const entries = await extractPd2Entries(file.download_url, null)
+                    if (entries.length > 0) {
+                        storePd2(ensureModId(), file.id, file.version || mod.version, entries)
                         yieldedIds.push(file.id)
-                        continue
                     }
-                    try {
-                        // file.download_url is already a storage URL — extract directly.
-                        // Use the mod-level version (the per-file one is usually blank for PD2);
-                        // modrex-main compares installs against the mod version for updates.
-                        const entries = await extractPd2Entries(file.download_url, null)
-                        storePd2(modId, file.id, file.version || mod.version, entries)
-                        if (entries.length > 0) yieldedIds.push(file.id)
-                    } catch (e) {
-                        errors.push(`pd2 mod ${mod.id} file ${file.id}: ${e}`)
-                        failed = true
-                    }
+                } catch (e) {
+                    errors.push(`pd2 mod ${mod.id} file ${file.id}: ${e}`)
+                    failed = true
                 }
             }
             if (!failed) putCheck(pd2SourceId, mod.id, mod.updated_at, yieldedIds)
@@ -1409,13 +1437,17 @@ async function main(): Promise<void> {
             try {
                 const resolved = await resolveDownload(fileId)
                 if (resolved) {
-                    insertMod.run(pdthSourceId, mod.id, mod.name, modUrl)
-                    const { id: modId } = getModId.get(pdthSourceId, mod.id) as { id: number }
                     const isPdmod = resolved.url.split('?')[0].toLowerCase().endsWith('.pdmod')
                     const entries = isPdmod
                         ? await extractPdmodEntry(resolved.url).then((e) => (e ? [e] : []))
                         : await extractPd2Entries(resolved.url, resolved.size)
-                    storePdth(modId, fileId, mod.version, entries)
+                    // Insert the mods row only when there's content to store, so a resolved
+                    // download that yields nothing doesn't leave a childless row.
+                    if (entries.length > 0) {
+                        insertMod.run(pdthSourceId, mod.id, mod.name, modUrl)
+                        const { id: modId } = getModId.get(pdthSourceId, mod.id) as { id: number }
+                        storePdth(modId, fileId, mod.version, entries)
+                    }
                     putCheck(pdthSourceId, mod.id, mod.updated_at, entries.length > 0 ? [fileId] : [])
                 }
             } catch (e) {
@@ -1432,27 +1464,34 @@ async function main(): Promise<void> {
             }
             let failed = false
             const yieldedIds: number[] = []
-            if (files.length > 0) {
-                insertMod.run(pdthSourceId, mod.id, mod.name, modUrl)
-                const { id: modId } = getModId.get(pdthSourceId, mod.id) as { id: number }
-                for (const file of files) {
-                    if (indexedPdthFileIds.has(file.id) && !missingNamePdthFileIds.has(file.id)) {
+            // Insert the mods row lazily on the first stored file, so a mod whose files
+            // all yield nothing doesn't become a childless mods row (see buildContentTasks).
+            let modIdCache: number | null =
+                (getModId.get(pdthSourceId, mod.id) as { id: number } | undefined)?.id ?? null
+            const ensureModId = (): number => {
+                if (modIdCache === null) {
+                    insertMod.run(pdthSourceId, mod.id, mod.name, modUrl)
+                    modIdCache = (getModId.get(pdthSourceId, mod.id) as { id: number }).id
+                }
+                return modIdCache
+            }
+            for (const file of files) {
+                if (indexedPdthFileIds.has(file.id) && !missingNamePdthFileIds.has(file.id)) {
+                    yieldedIds.push(file.id)
+                    continue
+                }
+                try {
+                    const entries =
+                        file.type === 'pdmod'
+                            ? await extractPdmodEntry(file.download_url).then((e) => (e ? [e] : []))
+                            : await extractPd2Entries(file.download_url, null)
+                    if (entries.length > 0) {
+                        storePdth(ensureModId(), file.id, file.version || mod.version, entries)
                         yieldedIds.push(file.id)
-                        continue
                     }
-                    try {
-                        const entries =
-                            file.type === 'pdmod'
-                                ? await extractPdmodEntry(file.download_url).then((e) =>
-                                      e ? [e] : []
-                                  )
-                                : await extractPd2Entries(file.download_url, null)
-                        storePdth(modId, file.id, file.version || mod.version, entries)
-                        if (entries.length > 0) yieldedIds.push(file.id)
-                    } catch (e) {
-                        errors.push(`pdth mod ${mod.id} file ${file.id}: ${e}`)
-                        failed = true
-                    }
+                } catch (e) {
+                    errors.push(`pdth mod ${mod.id} file ${file.id}: ${e}`)
+                    failed = true
                 }
             }
             if (!failed) putCheck(pdthSourceId, mod.id, mod.updated_at, yieldedIds)
@@ -1468,6 +1507,16 @@ async function main(): Promise<void> {
     await timePhase('processing', () =>
         runPool([...pd3Tasks, ...pd2Tasks, ...pdthTasks, ...cbTasks], CONCURRENCY)
     )
+
+    // Prune childless mods rows left by older builds (a mod inserted before the
+    // lazy-insert fix whose files never yielded). query_by_name in modrex-main matches
+    // mods without joining files, so these keep corrupting name-based identification.
+    // Safe because this indexer never deletes files: a zero-file mod is always a genuine
+    // zero-yield leftover, not a transient state.
+    const prunedChildless = db
+        .prepare('DELETE FROM mods WHERE NOT EXISTS (SELECT 1 FROM files WHERE files.mod_id = mods.id)')
+        .run().changes
+    if (prunedChildless > 0) console.log(`  Pruned ${prunedChildless} childless mod row(s).`)
 
     db.prepare('INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)').run(
         'last_run_at',
@@ -1491,7 +1540,7 @@ async function main(): Promise<void> {
     db.close()
     stateDb.close()
 
-    if (newFiles === 0 && filledNames === 0) {
+    if (newFiles === 0 && filledNames === 0 && prunedChildless === 0) {
         console.log('No new files — skipping upload.')
         process.exit(2)
     }
