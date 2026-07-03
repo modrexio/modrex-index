@@ -37,6 +37,9 @@ concurrency:
 jobs:
   update:
     runs-on: ubuntu-latest
+    # Worst legitimate case is a --recheck-all backfill (~2.5 h, API-throttle-bound).
+    # Without a cap a hung run holds the concurrency queue for the 6 h default.
+    timeout-minutes: 240
 
     steps:
       - uses: actions/checkout@v4
