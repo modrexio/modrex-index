@@ -31,12 +31,17 @@ const PDTH_GAME_ID = 2
 const CRIMEBOSS_GAME_ID = 857
 const USER_AGENT = 'modrex-indexer/1.0'
 const DB_PATH = join(import.meta.dirname, 'index.db')
+const STATE_DB_PATH = join(import.meta.dirname, 'builder-state.db')
 const STATS_PATH = join(import.meta.dirname, 'index-stats.json')
 // Faster than full_rebuild when adding a new format: only unindexed files are downloaded.
 const BACKFILL = process.argv.includes('--backfill')
 // Patches only the version column on existing rows from the listings — no downloads, no
 // extraction. Lets a stale-version index be corrected in minutes instead of a full backfill.
 const REPAIR_VERSIONS = process.argv.includes('--repair-versions')
+// Ignores recorded per-mod check state — every listed mod is re-examined (the pre-check-state
+// backfill cost). Escape hatch for the cases a check can wrongly suppress: a corrupt download
+// recorded as zero-yield, or a mod change that didn't touch its updated_at.
+const RECHECK_ALL = process.argv.includes('--recheck-all')
 const CONCURRENCY = parseInt(
     process.argv.find((a) => a.startsWith('--concurrency='))?.split('=')[1] ?? (BACKFILL ? '10' : '5')
 )
@@ -61,6 +66,7 @@ const metrics = {
     apiCalls: 0,
     storageRequests: 0,
     storageBytes: 0,
+    checkSkips: 0,
     phases: [] as { name: string; seconds: number }[],
 }
 
@@ -77,6 +83,7 @@ function writeRunSummary(mode: string, newFiles: number, filledNames: number, er
     const text =
         `Run summary (${mode}): ${metrics.apiCalls} API calls, ` +
         `${metrics.storageRequests} storage requests (${mb} MB), ` +
+        `${metrics.checkSkips} mods skipped via check state, ` +
         `${newFiles} new files, ${filledNames} names filled, ${errorCount} errors\n` +
         `Phases: ${phases}`
     console.log(`\n${text}`)
@@ -84,9 +91,9 @@ function writeRunSummary(mode: string, newFiles: number, filledNames: number, er
         appendFileSync(
             process.env.GITHUB_STEP_SUMMARY,
             `### Index build (${mode})\n\n` +
-                `| API calls | Storage requests | Downloaded | New files | Names filled | Errors |\n` +
-                `|---|---|---|---|---|---|\n` +
-                `| ${metrics.apiCalls} | ${metrics.storageRequests} | ${mb} MB | ${newFiles} | ${filledNames} | ${errorCount} |\n\n` +
+                `| API calls | Storage requests | Downloaded | Check skips | New files | Names filled | Errors |\n` +
+                `|---|---|---|---|---|---|---|\n` +
+                `| ${metrics.apiCalls} | ${metrics.storageRequests} | ${mb} MB | ${metrics.checkSkips} | ${newFiles} | ${filledNames} | ${errorCount} |\n\n` +
                 `Phases: ${phases}\n`
         )
     }
@@ -100,6 +107,9 @@ interface Mod {
     version: string
     has_download: boolean
     bumped_at: string
+    // Touched by any edit to the mod (more sensitive than bumped_at — verified live);
+    // what a mod_checks row is keyed against to decide "nothing changed, skip".
+    updated_at: string
     // The listing carries the primary download inline — no per-mod /files call needed.
     // download_type is 'file' (hosted), 'link' (external), or null (none).
     download_id: number | null
@@ -238,6 +248,57 @@ function openDb(): {
         pdthSourceId: pdthSource.id,
         cbSourceId: cbSource.id,
     }
+}
+
+// --- builder state (CI-only, published as its own release asset) ---
+//
+// Records, per mod, the listing updated_at it was last fully processed at and which file
+// remote_ids that pass yielded. Lives outside index.db so the user-facing DB carries no
+// CI bookkeeping, and so modrex-main's name-based identification (query_by_name, which
+// requires exactly one LIKE match over mods) never sees rows for zero-yield mods.
+// The state only ever accelerates a build: missing or stale state degrades to a full
+// recheck, never to wrong index content.
+
+interface ModCheck {
+    updatedAt: string
+    fileIds: number[]
+}
+
+function openStateDb(): DB {
+    const db = new Database(STATE_DB_PATH)
+    db.exec(`
+PRAGMA journal_mode = WAL;
+CREATE TABLE IF NOT EXISTS mod_checks (
+    source_id  INTEGER NOT NULL,
+    remote_id  INTEGER NOT NULL,
+    updated_at TEXT NOT NULL,
+    file_ids   TEXT NOT NULL,
+    checked_at TEXT NOT NULL,
+    PRIMARY KEY (source_id, remote_id)
+);`)
+    return db
+}
+
+function loadModChecks(stateDb: DB, sourceId: number): Map<number, ModCheck> {
+    const rows = stateDb
+        .prepare('SELECT remote_id, updated_at, file_ids FROM mod_checks WHERE source_id = ?')
+        .all(sourceId) as { remote_id: number; updated_at: string; file_ids: string }[]
+    return new Map(
+        rows.map((r) => [r.remote_id, { updatedAt: r.updated_at, fileIds: JSON.parse(r.file_ids) }])
+    )
+}
+
+// A check only suppresses re-processing while index.db still contains everything it yielded.
+// If index.db was restored from an older copy than the state db (release CDN staleness), the
+// yielded ids won't all be present and the mod is re-processed — index.db stays authoritative.
+function checkIsCurrent(
+    check: ModCheck | undefined,
+    mod: Mod,
+    indexedFileIds: Set<number>,
+    missingNameFileIds: Set<number>
+): boolean {
+    if (!check || check.updatedAt !== mod.updated_at) return false
+    return check.fileIds.every((id) => indexedFileIds.has(id) && !missingNameFileIds.has(id))
 }
 
 function writeIndexStats(db: DB): IndexStats {
@@ -910,6 +971,21 @@ function shouldDownload(type: string): boolean {
 async function main(): Promise<void> {
     console.log('Opening database...')
     const { db, pd3SourceId, pd2SourceId, pdthSourceId, cbSourceId } = openDb()
+    const stateDb = openStateDb()
+    const pd3Checks = loadModChecks(stateDb, pd3SourceId)
+    const pd2Checks = loadModChecks(stateDb, pd2SourceId)
+    const pdthChecks = loadModChecks(stateDb, pdthSourceId)
+    const cbChecks = loadModChecks(stateDb, cbSourceId)
+    const putCheckStmt = stateDb.prepare(
+        `INSERT INTO mod_checks (source_id, remote_id, updated_at, file_ids, checked_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(source_id, remote_id) DO UPDATE SET
+             updated_at = excluded.updated_at,
+             file_ids = excluded.file_ids,
+             checked_at = excluded.checked_at`
+    )
+    const putCheck = (sourceId: number, modRemoteId: number, updatedAt: string, fileIds: number[]) =>
+        putCheckStmt.run(sourceId, modRemoteId, updatedAt, JSON.stringify(fileIds), new Date().toISOString())
     const indexedPd3FileIds = getIndexedFileIds(db, pd3SourceId)
     const indexedPd2FileIds = getIndexedFileIds(db, pd2SourceId)
     const indexedPdthFileIds = getIndexedFileIds(db, pdthSourceId)
@@ -1013,6 +1089,7 @@ async function main(): Promise<void> {
         console.log(`Wrote index-stats.json (${stats.supportedMods} supported mods).`)
         writeRunSummary('repair-versions', 0, 0, 0)
         db.close()
+        stateDb.close()
         process.exit(fixed > 0 ? 0 : 2)
     }
 
@@ -1031,7 +1108,8 @@ async function main(): Promise<void> {
         sourceId: number,
         label: keyof typeof progress,
         indexedFileIds: Set<number>,
-        missingNameFileIds: Set<number>
+        missingNameFileIds: Set<number>,
+        checks: Map<number, ModCheck>
     ): Task[] {
         return mods.map((mod) => async () => {
             if (!mod.has_download) {
@@ -1046,6 +1124,17 @@ async function main(): Promise<void> {
                 indexedFileIds.has(mod.download_id) &&
                 !missingNameFileIds.has(mod.download_id)
             ) {
+                progress[label]++
+                return
+            }
+            // Mods whose listing carries no download_id (most of them) used to pay a
+            // throttled /files call every backfill even when fully indexed or known
+            // zero-yield, the recorded check is what makes them cost zero API calls.
+            if (
+                !RECHECK_ALL &&
+                checkIsCurrent(checks.get(mod.id), mod, indexedFileIds, missingNameFileIds)
+            ) {
+                metrics.checkSkips++
                 progress[label]++
                 return
             }
@@ -1070,6 +1159,8 @@ async function main(): Promise<void> {
                 )
             }
 
+            let failed = false
+            const yieldedIds: number[] = []
             for (const file of files) {
                 if (!shouldDownload(file.type)) continue
 
@@ -1080,6 +1171,7 @@ async function main(): Promise<void> {
                         new Date(file.updated_at) <
                             new Date(lastRunAt.getTime() - SINCE_BUFFER_MS))
                 ) {
+                    yieldedIds.push(file.id)
                     continue
                 }
 
@@ -1108,10 +1200,14 @@ async function main(): Promise<void> {
                     })()
                     indexedFileIds.add(file.id)
                     missingNameFileIds.delete(file.id)
+                    yieldedIds.push(file.id)
                 } catch (e) {
                     errors.push(`${label} mod ${mod.id} file ${file.id}: ${e}`)
+                    failed = true
                 }
             }
+            // Errors keep the mod retryable on the next run — its check is not advanced.
+            if (!failed) putCheck(sourceId, mod.id, mod.updated_at, yieldedIds)
 
             progress[label]++
             if (progress[label] % 50 === 0) printProgress()
@@ -1123,9 +1219,17 @@ async function main(): Promise<void> {
         pd3SourceId,
         'pd3',
         indexedPd3FileIds,
-        missingNamePd3FileIds
+        missingNamePd3FileIds,
+        pd3Checks
     )
-    const cbTasks = buildContentTasks(cbMods, cbSourceId, 'cb', indexedCbFileIds, missingNameCbFileIds)
+    const cbTasks = buildContentTasks(
+        cbMods,
+        cbSourceId,
+        'cb',
+        indexedCbFileIds,
+        missingNameCbFileIds,
+        cbChecks
+    )
 
     // --- PD2 tasks ---
 
@@ -1156,6 +1260,16 @@ async function main(): Promise<void> {
             progress.pd2++
             return
         }
+        // Zero-yield mods (link-only, >50 MB archives, no marker) used to be re-listed and
+        // re-downloaded every backfill, the recorded check is what memoizes that outcome.
+        if (
+            !RECHECK_ALL &&
+            checkIsCurrent(pd2Checks.get(mod.id), mod, indexedPd2FileIds, missingNamePd2FileIds)
+        ) {
+            metrics.checkSkips++
+            progress.pd2++
+            return
+        }
 
         const modUrl = `https://modworkshop.net/mod/${mod.id}`
 
@@ -1172,7 +1286,9 @@ async function main(): Promise<void> {
                 if (resolved) {
                     insertMod.run(pd2SourceId, mod.id, mod.name, modUrl)
                     const { id: modId } = getModId.get(pd2SourceId, mod.id) as { id: number }
-                    storePd2(modId, fileId, mod.version, await extractPd2Entries(resolved.url, resolved.size))
+                    const entries = await extractPd2Entries(resolved.url, resolved.size)
+                    storePd2(modId, fileId, mod.version, entries)
+                    putCheck(pd2SourceId, mod.id, mod.updated_at, entries.length > 0 ? [fileId] : [])
                 }
             } catch (e) {
                 errors.push(`pd2 mod ${mod.id} file ${fileId}: ${e}`)
@@ -1188,28 +1304,30 @@ async function main(): Promise<void> {
                 progress.pd2++
                 return
             }
+            let failed = false
+            const yieldedIds: number[] = []
             if (files.length > 0) {
                 insertMod.run(pd2SourceId, mod.id, mod.name, modUrl)
                 const { id: modId } = getModId.get(pd2SourceId, mod.id) as { id: number }
                 for (const file of files) {
                     if (indexedPd2FileIds.has(file.id) && !missingNamePd2FileIds.has(file.id)) {
+                        yieldedIds.push(file.id)
                         continue
                     }
                     try {
                         // file.download_url is already a storage URL — extract directly.
                         // Use the mod-level version (the per-file one is usually blank for PD2);
                         // modrex-main compares installs against the mod version for updates.
-                        storePd2(
-                            modId,
-                            file.id,
-                            file.version || mod.version,
-                            await extractPd2Entries(file.download_url, null)
-                        )
+                        const entries = await extractPd2Entries(file.download_url, null)
+                        storePd2(modId, file.id, file.version || mod.version, entries)
+                        if (entries.length > 0) yieldedIds.push(file.id)
                     } catch (e) {
                         errors.push(`pd2 mod ${mod.id} file ${file.id}: ${e}`)
+                        failed = true
                     }
                 }
             }
+            if (!failed) putCheck(pd2SourceId, mod.id, mod.updated_at, yieldedIds)
         }
 
         progress.pd2++
@@ -1244,6 +1362,14 @@ async function main(): Promise<void> {
             progress.pdth++
             return
         }
+        if (
+            !RECHECK_ALL &&
+            checkIsCurrent(pdthChecks.get(mod.id), mod, indexedPdthFileIds, missingNamePdthFileIds)
+        ) {
+            metrics.checkSkips++
+            progress.pdth++
+            return
+        }
 
         const modUrl = `https://modworkshop.net/mod/${mod.id}`
 
@@ -1263,6 +1389,7 @@ async function main(): Promise<void> {
                         ? await extractPdmodEntry(resolved.url).then((e) => (e ? [e] : []))
                         : await extractPd2Entries(resolved.url, resolved.size)
                     storePdth(modId, fileId, mod.version, entries)
+                    putCheck(pdthSourceId, mod.id, mod.updated_at, entries.length > 0 ? [fileId] : [])
                 }
             } catch (e) {
                 errors.push(`pdth mod ${mod.id} file ${fileId}: ${e}`)
@@ -1276,11 +1403,14 @@ async function main(): Promise<void> {
                 progress.pdth++
                 return
             }
+            let failed = false
+            const yieldedIds: number[] = []
             if (files.length > 0) {
                 insertMod.run(pdthSourceId, mod.id, mod.name, modUrl)
                 const { id: modId } = getModId.get(pdthSourceId, mod.id) as { id: number }
                 for (const file of files) {
                     if (indexedPdthFileIds.has(file.id) && !missingNamePdthFileIds.has(file.id)) {
+                        yieldedIds.push(file.id)
                         continue
                     }
                     try {
@@ -1291,11 +1421,14 @@ async function main(): Promise<void> {
                                   )
                                 : await extractPd2Entries(file.download_url, null)
                         storePdth(modId, file.id, file.version || mod.version, entries)
+                        if (entries.length > 0) yieldedIds.push(file.id)
                     } catch (e) {
                         errors.push(`pdth mod ${mod.id} file ${file.id}: ${e}`)
+                        failed = true
                     }
                 }
             }
+            if (!failed) putCheck(pdthSourceId, mod.id, mod.updated_at, yieldedIds)
         }
 
         progress.pdth++
@@ -1329,6 +1462,7 @@ async function main(): Promise<void> {
     writeRunSummary(BACKFILL ? 'backfill' : 'incremental', newFiles, filledNames, errors.length)
 
     db.close()
+    stateDb.close()
 
     if (newFiles === 0 && filledNames === 0) {
         console.log('No new files — skipping upload.')

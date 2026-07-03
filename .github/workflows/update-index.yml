@@ -15,6 +15,10 @@ on:
         description: 'Repair versions only (rewrite the version column from the listings — no downloads, ~minutes)'
         type: boolean
         default: false
+      recheck_all:
+        description: 'Ignore per-mod check state (re-examine every mod — use if a mod was wrongly skipped, e.g. after a coverage change)'
+        type: boolean
+        default: false
       concurrency:
         description: 'Storage download parallelism (default 5, backfill 10; API calls are throttled separately so higher is safe)'
         type: string
@@ -81,6 +85,24 @@ jobs:
             exit 1
           fi
 
+      - name: Download builder state
+        if: ${{ !inputs.full_rebuild }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Best-effort, unlike index.db: builder-state.db only *accelerates* the build
+          # (per-mod check state). Missing or corrupt state degrades to a full recheck,
+          # never to wrong index content — so don't retry and never fail the job over it.
+          rm -f builder-state.db builder-state.db-wal builder-state.db-shm
+          aid=$(gh api "repos/${{ github.repository }}/releases/tags/latest-index" --jq '.assets[] | select(.name=="builder-state.db") | .id' 2>/dev/null)
+          if [ -n "$aid" ]; then
+            gh api -H "Accept: application/octet-stream" "repos/${{ github.repository }}/releases/assets/$aid" > builder-state.db 2>/dev/null || true
+          fi
+          if [ -f builder-state.db ] && ! node -e "const d=new(require('better-sqlite3'))('builder-state.db',{readonly:true});const ok=d.pragma('integrity_check',{simple:true})==='ok';d.close();process.exit(ok?0:1)" 2>/dev/null; then
+            echo "builder-state.db corrupt — starting with fresh state"
+            rm -f builder-state.db
+          fi
+
       - name: Run indexer
         id: indexer
         run: |
@@ -88,6 +110,7 @@ jobs:
           args=""
           ${{ inputs.backfill == true }} && args="$args --backfill"
           ${{ inputs.repair_versions == true }} && args="$args --repair-versions"
+          ${{ inputs.recheck_all == true }} && args="$args --recheck-all"
           [ -n "${{ inputs.concurrency }}" ] && args="$args --concurrency=${{ inputs.concurrency }}"
           pnpm build-index $args
           code=$?
@@ -111,3 +134,13 @@ jobs:
         run: |
           test -f index-stats.json
           gh release upload latest-index index-stats.json --clobber
+
+      - name: Upload builder state
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Uploaded on exit 0 and 2 alike — check state advances even when no new files
+          # were indexed (that's the entire point of a no-op run finishing fast next time).
+          if [ -f builder-state.db ]; then
+            gh release upload latest-index builder-state.db --clobber
+          fi
