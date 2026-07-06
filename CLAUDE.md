@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with th
 
 ## What this is
 
-TypeScript build pipeline that downloads every mod file from modworkshop.net for PD2, PDTH, PD3, and Crime Boss: Rockay City, hashes the relevant content with SHA256, and stores the results in `index.db` (SQLite). The database is published as a GitHub Release asset (`modrexio/modrex-index`, tag `latest-index`) — never committed to git. A tiny `index-stats.json` asset is published beside it for website counters; it also carries `lastRunAt` — the incremental window — because it's uploaded on every run, unlike `index.db` (a no-op exit-2 run skips the DB upload, so the DB's own `last_run_at` metadata can be stale; the indexer takes the later of the two at startup). `modrex-main` downloads `index.db` on startup with a 1-hour TTL cached in `app_data_dir()`.
+TypeScript build pipeline that downloads every mod file from modworkshop.net for PD2, PDTH, PD3, Crime Boss: Rockay City, and RAID: World War II, hashes the relevant content with SHA256, and stores the results in `index.db` (SQLite). The database is published as a GitHub Release asset (`modrexio/modrex-index`, tag `latest-index`) — never committed to git. A tiny `index-stats.json` asset is published beside it for website counters; it also carries `lastRunAt` — the incremental window — because it's uploaded on every run, unlike `index.db` (a no-op exit-2 run skips the DB upload, so the DB's own `last_run_at` metadata can be stale; the indexer takes the later of the two at startup). `modrex-main` downloads `index.db` on startup with a 1-hour TTL cached in `app_data_dir()`.
 
 ## Commands
 
@@ -33,7 +33,7 @@ lookup-mod.mjs    ← dev util: look up a mod by SHA256
 ### SQLite schema
 
 ```sql
-games         (id, name, slug)                                      -- "PAYDAY 3"/"pd3", "PAYDAY 2"/"pd2", "PAYDAY: The Heist"/"pdth", "Crime Boss: Rockay City"/"cb"
+games         (id, name, slug)                                      -- "PAYDAY 3"/"pd3", "PAYDAY 2"/"pd2", "PAYDAY: The Heist"/"pdth", "Crime Boss: Rockay City"/"cb", "RAID: World War II"/"raid"
 sources       (id, game_id, name, base_url, game_ref)               -- modworkshop source per game
 mods          (id, source_id, remote_id, name, url)                 -- one row per mod
 file_contents (sha256)                                              -- deduplication; sha256 is PK
@@ -68,7 +68,7 @@ PD3 and Crime Boss are both UE pak-based with no marker-file shortcut available,
 
 `detectFormat` also recognizes RAR by magic bytes (`Rar!\x1a\x07`) for this path — found missing after a live backfill showed several real Crime Boss mods (e.g. character cosmetic mods distributed as `.rar`) silently produced zero indexed files: `shouldDownload` didn't recognize the `"rar"` modworkshop file type at all, so the file was skipped before download ever started. Both gaps are fixed (`shouldDownload` now includes `rar`; the RAR branch shells out to the same `7z` CLI `extractPd2FromFull` already uses for PD2/PDTH, extracting everything and filtering by `CONTENT_EXTENSIONS` in JS rather than relying on 7z's RAR mask support, which is less reliable than for zip/7z). **Verify after the next backfill**: a real RAR-only mod (e.g. modworkshop id `56889`, "Hideo Kojima") should go from 0 indexed files to its expected count.
 
-PD2/PDTH mods aren't `.pak` — for them the indexer hashes one representative marker file per mod (`mod.txt` / `main.xml` / wrapper-relative first file via `selectMarkerPath`, chosen to match `modrex-main`'s `first_file_in_dir`). ZIPs use HTTP Range to fetch only that file; RAR/7z have no such trick, so they're fully downloaded and gated by `PD2_MAX_FULL_DOWNLOAD_BYTES` (50 MB) — larger ones are skipped. This is what lets `modrex-main` identify marker-less asset/background packs (incl. recovered host packs) by SHA256.
+PD2/PDTH/RAID mods aren't `.pak` — for them the indexer hashes one representative marker file per mod (`mod.txt` / `main.xml` / `supermod.xml` / `mod.xml` / wrapper-relative first file via `selectMarkerPath`, chosen to match `modrex-main`'s `hashable_file_for_mod_dir`). `supermod.xml` (RAID-SuperBLT) and `mod.xml` (legacy RaidBLT) are RAID's markers — the RAID BLT fork has no `mod.txt`; they sit below the PD2/PDTH markers in the preference order so archives shipping both keep their existing pick. ZIPs use HTTP Range to fetch only that file; RAR/7z have no such trick, so they're fully downloaded and gated by `PD2_MAX_FULL_DOWNLOAD_BYTES` (50 MB) — larger ones are skipped. This is what lets `modrex-main` identify marker-less asset/background packs (incl. recovered host packs) by SHA256.
 
 PDTH additionally handles `.pdmod` files: decrypted via `7z` with a hardcoded password, then the `pdmod.json` manifest's `BundlePath`/`BundleExtension` uint64 fields are resolved against `pdmod_hashlist.txt` (committed, 130k entries, Bob Jenkins lookup8) to recover asset paths — the alphabetically-first resolved path's replacement file is hashed. `pdmod_hashlist.txt` must stay committed; without it all `.pdmod` mods produce zero indexed files.
 

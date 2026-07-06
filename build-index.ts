@@ -1,7 +1,7 @@
 #!/usr/bin/env npx tsx
 /**
- * Builds the PD3 + PD2 + PDTH + Crime Boss mod hash index from modworkshop directly into
- * SQLite.
+ * Builds the PD3 + PD2 + PDTH + Crime Boss + RAID WW2 mod hash index from modworkshop
+ * directly into SQLite.
  *
  * Run:   pnpm build-index
  * Output: index.db
@@ -9,8 +9,9 @@
  * Resumable — already-indexed fileIds are skipped on re-run.
  * PD3 / Crime Boss: streams each download directly into SHA256, extracting .pak/.ucas/.utoc
  *      (UE5 IoStore content) and .lua (UE4SS Lua sub-mods) — no temp files needed for ZIP.
- * PD2 / PDTH: uses HTTP Range requests on ZIP archives to fetch only the marker file
- *      (mod.txt / main.xml / first alphabetical file) without downloading the full archive.
+ * PD2 / PDTH / RAID: uses HTTP Range requests on ZIP archives to fetch only the marker file
+ *      (mod.txt / main.xml / supermod.xml / mod.xml / first alphabetical file) without
+ *      downloading the full archive.
  *      RAR and 7z archives under 50 MB are fully downloaded and extracted via the 7z CLI.
  * Downloads CONCURRENCY files in parallel to cut total runtime.
  */
@@ -29,6 +30,7 @@ const PD3_GAME_ID = 853
 const PD2_GAME_ID = 1
 const PDTH_GAME_ID = 2
 const CRIMEBOSS_GAME_ID = 857
+const RAID_GAME_ID = 543
 const USER_AGENT = 'modrex-indexer/1.0'
 const DB_PATH = join(import.meta.dirname, 'index.db')
 const STATE_DB_PATH = join(import.meta.dirname, 'builder-state.db')
@@ -205,6 +207,7 @@ function openDb(): {
     pd2SourceId: number
     pdthSourceId: number
     cbSourceId: number
+    raidSourceId: number
 } {
     const db = new Database(DB_PATH)
     db.exec(SCHEMA)
@@ -246,12 +249,19 @@ function openDb(): {
     upsertSource.run(cbGame.id, 'modworkshop', BASE, String(CRIMEBOSS_GAME_ID))
     const cbSource = getSource.get(cbGame.id, 'modworkshop') as { id: number }
 
+    // Name matches modrex-main's RAID_ENGINE.index_game_name — load-bearing, see above.
+    upsertGame.run('RAID: World War II', 'raid')
+    const raidGame = getGame.get('raid') as { id: number }
+    upsertSource.run(raidGame.id, 'modworkshop', BASE, String(RAID_GAME_ID))
+    const raidSource = getSource.get(raidGame.id, 'modworkshop') as { id: number }
+
     return {
         db,
         pd3SourceId: pd3Source.id,
         pd2SourceId: pd2Source.id,
         pdthSourceId: pdthSource.id,
         cbSourceId: cbSource.id,
+        raidSourceId: raidSource.id,
     }
 }
 
@@ -688,6 +698,22 @@ function selectMarkerPath(paths: string[]): string | null {
     })
     if (mainXml) return mainXml
 
+    // RAID BLT markers: supermod.xml (RAID-SuperBLT) or mod.xml (legacy RaidBLT) — the RAID
+    // fork has no mod.txt. Checked after the PD2/PDTH markers so archives shipping both keep
+    // their existing pick; the same order is mirrored in modrex-main's
+    // hashable_file_for_mod_dir so both sides hash the same representative file.
+    const supermodXml = files.find((p) => {
+        const l = p.toLowerCase()
+        return (l === 'supermod.xml' || l.endsWith('/supermod.xml')) && depth(p) <= 1
+    })
+    if (supermodXml) return supermodXml
+
+    const modXml = files.find((p) => {
+        const l = p.toLowerCase()
+        return (l === 'mod.xml' || l.endsWith('/mod.xml')) && depth(p) <= 1
+    })
+    if (modXml) return modXml
+
     // single top-level folder means wrapper — sort relative to it to match first_file_in_dir
     const sorted = [...files].sort((a, b) => a.localeCompare(b))
     const roots = [...new Set(files.map((p) => p.split('/')[0]))]
@@ -987,12 +1013,13 @@ function shouldDownload(type: string): boolean {
 
 async function main(): Promise<void> {
     console.log('Opening database...')
-    const { db, pd3SourceId, pd2SourceId, pdthSourceId, cbSourceId } = openDb()
+    const { db, pd3SourceId, pd2SourceId, pdthSourceId, cbSourceId, raidSourceId } = openDb()
     const stateDb = openStateDb()
     const pd3Checks = loadModChecks(stateDb, pd3SourceId)
     const pd2Checks = loadModChecks(stateDb, pd2SourceId)
     const pdthChecks = loadModChecks(stateDb, pdthSourceId)
     const cbChecks = loadModChecks(stateDb, cbSourceId)
+    const raidChecks = loadModChecks(stateDb, raidSourceId)
     const putCheckStmt = stateDb.prepare(
         `INSERT INTO mod_checks (source_id, remote_id, updated_at, file_ids, checked_at)
          VALUES (?, ?, ?, ?, ?)
@@ -1007,24 +1034,28 @@ async function main(): Promise<void> {
     const indexedPd2FileIds = getIndexedFileIds(db, pd2SourceId)
     const indexedPdthFileIds = getIndexedFileIds(db, pdthSourceId)
     const indexedCbFileIds = getIndexedFileIds(db, cbSourceId)
+    const indexedRaidFileIds = getIndexedFileIds(db, raidSourceId)
     const indexedPd2ModIds = getIndexedModIds(db, pd2SourceId)
     const indexedPdthModIds = getIndexedModIds(db, pdthSourceId)
+    const indexedRaidModIds = getIndexedModIds(db, raidSourceId)
     const missingNamePd3FileIds = BACKFILL ? getFileIdsMissingNames(db, pd3SourceId) : new Set<number>()
     const missingNamePd2FileIds = BACKFILL ? getFileIdsMissingNames(db, pd2SourceId) : new Set<number>()
     const missingNamePdthFileIds = BACKFILL ? getFileIdsMissingNames(db, pdthSourceId) : new Set<number>()
     const missingNameCbFileIds = BACKFILL ? getFileIdsMissingNames(db, cbSourceId) : new Set<number>()
+    const missingNameRaidFileIds = BACKFILL ? getFileIdsMissingNames(db, raidSourceId) : new Set<number>()
     console.log(
-        `  ${indexedPd3FileIds.size} PD3 + ${indexedPd2FileIds.size} PD2 + ${indexedPdthFileIds.size} PDTH + ${indexedCbFileIds.size} CB files already indexed`
+        `  ${indexedPd3FileIds.size} PD3 + ${indexedPd2FileIds.size} PD2 + ${indexedPdthFileIds.size} PDTH + ${indexedCbFileIds.size} CB + ${indexedRaidFileIds.size} RAID files already indexed`
     )
     if (
         BACKFILL &&
         (missingNamePd3FileIds.size > 0 ||
             missingNamePd2FileIds.size > 0 ||
             missingNamePdthFileIds.size > 0 ||
-            missingNameCbFileIds.size > 0)
+            missingNameCbFileIds.size > 0 ||
+            missingNameRaidFileIds.size > 0)
     ) {
         console.log(
-            `  ${missingNamePd3FileIds.size} PD3 + ${missingNamePd2FileIds.size} PD2 + ${missingNamePdthFileIds.size} PDTH + ${missingNameCbFileIds.size} CB files missing entry names — will re-download`
+            `  ${missingNamePd3FileIds.size} PD3 + ${missingNamePd2FileIds.size} PD2 + ${missingNamePdthFileIds.size} PDTH + ${missingNameCbFileIds.size} CB + ${missingNameRaidFileIds.size} RAID files missing entry names — will re-download`
         )
     }
 
@@ -1072,7 +1103,7 @@ async function main(): Promise<void> {
     // Fetch both mod lists before building tasks so closures can reference both lengths.
     // Repair scans every mod (since = null) so it can correct any stale version.
     const since = BACKFILL || REPAIR_VERSIONS ? null : lastRunAt
-    const { pd3Mods, pd2Mods, pdthMods, cbMods } = await timePhase('listing', async () => {
+    const { pd3Mods, pd2Mods, pdthMods, cbMods, raidMods } = await timePhase('listing', async () => {
         console.log('Fetching PD3 mod list...')
         const pd3Mods = await listModsSince(PD3_GAME_ID, since)
         console.log(`  ${pd3Mods.length} PD3 mods to process\n`)
@@ -1088,7 +1119,11 @@ async function main(): Promise<void> {
         console.log('Fetching Crime Boss mod list...')
         const cbMods = await listModsSince(CRIMEBOSS_GAME_ID, since)
         console.log(`  ${cbMods.length} Crime Boss mods to process\n`)
-        return { pd3Mods, pd2Mods, pdthMods, cbMods }
+
+        console.log('Fetching RAID mod list...')
+        const raidMods = await listModsSince(RAID_GAME_ID, since)
+        console.log(`  ${raidMods.length} RAID mods to process\n`)
+        return { pd3Mods, pd2Mods, pdthMods, cbMods, raidMods }
     })
 
     // Version-only repair: rewrite the version column on already-indexed files from the
@@ -1110,6 +1145,7 @@ async function main(): Promise<void> {
         repair(pd2Mods, pd2SourceId)
         repair(pdthMods, pdthSourceId)
         repair(cbMods, cbSourceId)
+        repair(raidMods, raidSourceId)
         console.log(`\nVersion repair: rewrote ${fixed} file version(s).`)
         // Repair scans with since = null and must not move the incremental window.
         const stats = writeIndexStats(db, lastRunAt?.toISOString() ?? null)
@@ -1120,11 +1156,11 @@ async function main(): Promise<void> {
         process.exit(fixed > 0 ? 0 : 2)
     }
 
-    const progress = { pd3: 0, pd2: 0, pdth: 0, cb: 0 }
+    const progress = { pd3: 0, pd2: 0, pdth: 0, cb: 0, raid: 0 }
     const printProgress = () => {
         const total = (db.prepare('SELECT COUNT(*) as n FROM files').get() as { n: number }).n
         console.log(
-            `  [PD3: ${progress.pd3}/${pd3Mods.length} — PD2: ${progress.pd2}/${pd2Mods.length} — PDTH: ${progress.pdth}/${pdthMods.length} — CB: ${progress.cb}/${cbMods.length} — ${total} files indexed]`
+            `  [PD3: ${progress.pd3}/${pd3Mods.length} — PD2: ${progress.pd2}/${pd2Mods.length} — PDTH: ${progress.pdth}/${pdthMods.length} — CB: ${progress.cb}/${cbMods.length} — RAID: ${progress.raid}/${raidMods.length} — ${total} files indexed]`
         )
     }
 
@@ -1501,11 +1537,117 @@ async function main(): Promise<void> {
         if (progress.pdth % 50 === 0) printProgress()
     })
 
+    // --- RAID tasks (same extraction strategy as PD2; markers are supermod.xml / mod.xml) ---
+
+    const storeRaid = (modId: number, fileId: number, version: string, entries: ContentEntry[]) => {
+        if (entries.length === 0) return
+        db.transaction(() => {
+            for (const { sha256, entryName } of entries) {
+                insertContent.run(sha256)
+                const { changes } = insertFile.run(
+                    modId,
+                    sha256,
+                    fileId,
+                    version,
+                    new Date().toISOString(),
+                    entryName
+                )
+                if (changes > 0) newFiles++
+                else if (fillEntryName.run(entryName, modId, sha256).changes > 0) filledNames++
+            }
+        })()
+        indexedRaidFileIds.add(fileId)
+        missingNameRaidFileIds.delete(fileId)
+    }
+
+    const raidTasks: Task[] = raidMods.map((mod) => async () => {
+        if (!mod.has_download) {
+            progress.raid++
+            return
+        }
+        if (
+            !RECHECK_ALL &&
+            checkIsCurrent(raidChecks.get(mod.id), mod, indexedRaidFileIds, missingNameRaidFileIds)
+        ) {
+            metrics.checkSkips++
+            progress.raid++
+            return
+        }
+
+        const modUrl = `https://modworkshop.net/mod/${mod.id}`
+
+        if (mod.download_type === 'file' && mod.download_id != null) {
+            const fileId = mod.download_id
+            if (indexedRaidFileIds.has(fileId) && !missingNameRaidFileIds.has(fileId)) {
+                progress.raid++
+                return
+            }
+            try {
+                const resolved = await resolveDownload(fileId)
+                if (resolved) {
+                    const entries = await extractPd2Entries(resolved.url, resolved.size)
+                    // Insert the mods row only when there's content to store, so a resolved
+                    // download that yields nothing doesn't leave a childless row.
+                    if (entries.length > 0) {
+                        insertMod.run(raidSourceId, mod.id, mod.name, modUrl)
+                        const { id: modId } = getModId.get(raidSourceId, mod.id) as { id: number }
+                        storeRaid(modId, fileId, mod.version, entries)
+                    }
+                    putCheck(raidSourceId, mod.id, mod.updated_at, entries.length > 0 ? [fileId] : [])
+                }
+            } catch (e) {
+                errors.push(`raid mod ${mod.id} file ${fileId}: ${e}`)
+            }
+        } else if (!indexedRaidModIds.has(mod.id)) {
+            let files: ModFile[] = []
+            try {
+                files = await listModFiles(mod.id)
+            } catch (e) {
+                errors.push(`raid mod ${mod.id}: failed to list files — ${e}`)
+                progress.raid++
+                return
+            }
+            let failed = false
+            const yieldedIds: number[] = []
+            // Insert the mods row lazily on the first stored file, so a mod whose files
+            // all yield nothing doesn't become a childless mods row (see buildContentTasks).
+            let modIdCache: number | null =
+                (getModId.get(raidSourceId, mod.id) as { id: number } | undefined)?.id ?? null
+            const ensureModId = (): number => {
+                if (modIdCache === null) {
+                    insertMod.run(raidSourceId, mod.id, mod.name, modUrl)
+                    modIdCache = (getModId.get(raidSourceId, mod.id) as { id: number }).id
+                }
+                return modIdCache
+            }
+            for (const file of files) {
+                if (indexedRaidFileIds.has(file.id) && !missingNameRaidFileIds.has(file.id)) {
+                    yieldedIds.push(file.id)
+                    continue
+                }
+                try {
+                    const entries = await extractPd2Entries(file.download_url, null)
+                    if (entries.length > 0) {
+                        storeRaid(ensureModId(), file.id, file.version || mod.version, entries)
+                        yieldedIds.push(file.id)
+                    }
+                } catch (e) {
+                    errors.push(`raid mod ${mod.id} file ${file.id}: ${e}`)
+                    failed = true
+                }
+            }
+            if (!failed) putCheck(raidSourceId, mod.id, mod.updated_at, yieldedIds)
+        }
+
+        progress.raid++
+        if (progress.raid % 50 === 0) printProgress()
+    })
+
     console.log(
-        `Processing ${pd3Mods.length} PD3 + ${pd2Mods.length} PD2 + ${pdthMods.length} PDTH + ${cbMods.length} CB mods with ${CONCURRENCY} workers...\n`
+        `Processing ${pd3Mods.length} PD3 + ${pd2Mods.length} PD2 + ${pdthMods.length} PDTH + ${cbMods.length} CB + ${raidMods.length} RAID mods with ${CONCURRENCY} workers...\n`
     )
     await timePhase('processing', () =>
-        runPool([...pd3Tasks, ...pd2Tasks, ...pdthTasks, ...cbTasks], CONCURRENCY)
+        runPool([...pd3Tasks, ...pd2Tasks, ...pdthTasks, ...cbTasks, ...raidTasks], CONCURRENCY)
     )
 
     // Prune childless mods rows left by older builds (a mod inserted before the
