@@ -2,6 +2,7 @@
     "name": "modrex-index",
     "version": "1.0.0",
     "type": "module",
+    "license": "MIT",
     "scripts": {
         "build-index": "tsx build-index.ts"
     },
