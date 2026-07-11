@@ -1,6 +1,6 @@
 import Database from 'better-sqlite3'
 
-const APP_DB = 'C:/Users/oleh/AppData/Roaming/io.github.shulhaoleh.pd3modmanager/mod-index.db'
+const APP_DB = 'C:/Users/oleh/AppData/Roaming/Modrex/mod-index.db'
 const query = process.argv[2]
 if (!query) { console.log('Usage: node lookup-mod.mjs <mod name or remote_id>'); process.exit(1) }
 

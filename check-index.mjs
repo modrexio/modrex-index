@@ -1,6 +1,6 @@
 import Database from 'better-sqlite3'
 
-const APP_DB = 'C:/Users/oleh/AppData/Roaming/io.github.shulhaoleh.pd3modmanager/mod-index.db'
+const APP_DB = 'C:/Users/oleh/AppData/Roaming/Modrex/mod-index.db'
 
 const db = new Database(APP_DB, { readonly: true })
 const count = db.prepare('SELECT COUNT(*) as n FROM files').get()

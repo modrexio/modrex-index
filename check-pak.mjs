@@ -2,7 +2,7 @@ import Database from 'better-sqlite3'
 import { createHash } from 'crypto'
 import { readFileSync } from 'fs'
 
-const APP_DB = 'C:/Users/oleh/AppData/Roaming/io.github.shulhaoleh.pd3modmanager/mod-index.db'
+const APP_DB = 'C:/Users/oleh/AppData/Roaming/Modrex/mod-index.db'
 const pakPath = process.argv[2]
 if (!pakPath) { console.log('Usage: node check-pak.mjs <path-to-pak-file>'); process.exit(1) }
 
