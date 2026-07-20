@@ -4,7 +4,8 @@
     "type": "module",
     "license": "MIT",
     "scripts": {
-        "build-index": "tsx build-index.ts"
+        "build-index": "tsx build-index.ts",
+        "test:staged-rebuild": "node test-staged-rebuild.mjs"
     },
     "devDependencies": {
         "@types/adm-zip": "^0.5.8",

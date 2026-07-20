@@ -36,9 +36,10 @@ concurrency:
 
 jobs:
   update:
+    if: ${{ !inputs.full_rebuild }}
     runs-on: ubuntu-latest
-    # Worst legitimate case is a --recheck-all backfill (~2.5 h, API-throttle-bound).
-    # Without a cap a hung run holds the concurrency queue for the 6 h default.
+    # Incremental/backfill runs fit comfortably below this. Full rebuilds use the
+    # checkpointed jobs below because a single hosted job cannot exceed six hours.
     timeout-minutes: 240
 
     steps:
@@ -149,3 +150,141 @@ jobs:
           if [ -f builder-state.db ]; then
             bash .github/scripts/publish-release-asset.sh latest-index builder-state.db
           fi
+
+  rebuild-pd3:
+    if: ${{ inputs.full_rebuild }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/rebuild-stage
+        with:
+          game: pd3
+          output-artifact: rebuild-pd3
+          concurrency: ${{ inputs.concurrency }}
+
+  # PD2 is API-throttle-bound and takes roughly five hours from an empty DB. Three
+  # time-bounded jobs persist progress well before the hosted-runner limit; the
+  # fourth finishes whatever remains.
+  rebuild-pd2-1:
+    if: ${{ inputs.full_rebuild }}
+    needs: rebuild-pd3
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/rebuild-stage
+        with:
+          game: pd2
+          input-artifact: rebuild-pd3
+          output-artifact: rebuild-pd2-1
+          max-runtime-minutes: 100
+          concurrency: ${{ inputs.concurrency }}
+
+  rebuild-pd2-2:
+    if: ${{ inputs.full_rebuild }}
+    needs: rebuild-pd2-1
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/rebuild-stage
+        with:
+          game: pd2
+          input-artifact: rebuild-pd2-1
+          output-artifact: rebuild-pd2-2
+          max-runtime-minutes: 100
+          concurrency: ${{ inputs.concurrency }}
+
+  rebuild-pd2-3:
+    if: ${{ inputs.full_rebuild }}
+    needs: rebuild-pd2-2
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/rebuild-stage
+        with:
+          game: pd2
+          input-artifact: rebuild-pd2-2
+          output-artifact: rebuild-pd2-3
+          max-runtime-minutes: 100
+          concurrency: ${{ inputs.concurrency }}
+
+  rebuild-pd2-final:
+    if: ${{ inputs.full_rebuild }}
+    needs: rebuild-pd2-3
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - id: stage
+        uses: ./.github/actions/rebuild-stage
+        with:
+          game: pd2
+          input-artifact: rebuild-pd2-3
+          output-artifact: rebuild-pd2-final
+          concurrency: ${{ inputs.concurrency }}
+      - name: Require complete PD2 stage
+        if: ${{ steps.stage.outputs.complete != 'true' }}
+        run: exit 1
+
+  rebuild-pdth:
+    if: ${{ inputs.full_rebuild }}
+    needs: rebuild-pd2-final
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/rebuild-stage
+        with:
+          game: pdth
+          input-artifact: rebuild-pd2-final
+          output-artifact: rebuild-pdth
+          concurrency: ${{ inputs.concurrency }}
+
+  rebuild-crime-boss:
+    if: ${{ inputs.full_rebuild }}
+    needs: rebuild-pdth
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/rebuild-stage
+        with:
+          game: cb
+          input-artifact: rebuild-pdth
+          output-artifact: rebuild-crime-boss
+          concurrency: ${{ inputs.concurrency }}
+
+  rebuild-raid:
+    if: ${{ inputs.full_rebuild }}
+    needs: rebuild-crime-boss
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/rebuild-stage
+        with:
+          game: raid
+          input-artifact: rebuild-crime-boss
+          output-artifact: rebuild-final
+          finalize: true
+          concurrency: ${{ inputs.concurrency }}
+
+      # Production remains untouched until every game is complete and both SQLite
+      # databases have passed integrity checks in the composite action.
+      - name: Publish rebuilt index
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash .github/scripts/publish-release-asset.sh latest-index index.db
+
+      - name: Publish rebuilt stats
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash .github/scripts/publish-release-asset.sh latest-index index-stats.json
+
+      - name: Publish rebuilt state
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash .github/scripts/publish-release-asset.sh latest-index builder-state.db

@@ -51,6 +51,21 @@ Triggered via `workflow_dispatch` (no built-in cron). Hashes mod files from modw
 
 The workflow downloads the previous `index.db` from the release before running so the build is incremental. Download is retried up to 5× with an integrity check (`PRAGMA integrity_check`) because the release CDN can briefly serve a stale copy after an asset is replaced. Concurrent runs are queued, not cancelled (`cancel-in-progress: false`), to avoid splitting the shared 90 req/min API budget.
 
+A full rebuild cannot fit safely in one GitHub-hosted job: PD2 alone is close to the
+six-hour hard limit. The workflow therefore runs one game at a time and carries
+`index.db` plus `builder-state.db` between jobs as short-lived Actions artifacts.
+PD2 is additionally divided into three 100-minute checkpoint jobs and one finishing
+job. Each checkpoint re-lists PD2 and skips completed mods via `mod_checks`, so list
+reordering cannot create gaps. Partial databases are never published. The final RAID
+job verifies that every game completed, writes the original rebuild start time as
+`last_run_at`, integrity-checks both databases, stores a final recovery artifact,
+and only then promotes the three release assets.
+
+Release assets are replaced through `.github/scripts/publish-release-asset.sh`:
+upload under a unique staged name, verify size and SHA256, preserve the old asset as
+a rollback copy, then promote the staged asset. Never restore `gh release upload
+--clobber`; it deletes the live asset before the replacement upload has succeeded.
+
 Exit code `2` means "nothing new — skip upload"; the workflow gates the release-asset upload on exit code `0`. Exit `1` means an unhandled error.
 
 **Run modes** (`workflow_dispatch` inputs / CLI flags):
@@ -59,6 +74,10 @@ Exit code `2` means "nothing new — skip upload"; the workflow gates the releas
 - `--backfill` — scans **all** mods (`since = null`), skipping already-indexed files and mods whose `mod_checks` state is current (see builder state below). Cheap to re-run: a backfill where nothing changed costs roughly the listing pages (~10 min), not the historical ~2 h.
 - `--recheck-all` — ignores `mod_checks` entirely; every listed mod is re-examined (the pre-check-state backfill cost). **Required after any coverage change** (a new archive format, a new game, or raising `PD2_MAX_FULL_DOWNLOAD_BYTES`): a plain backfill skips checked mods, so previously-skipped files only get picked up by `--backfill --recheck-all`. Also the escape hatch if a mod was wrongly memoized (corrupt download recorded as zero-yield, or a mod change that didn't touch its `updated_at`).
 - `--repair-versions` — rewrites the `version` column from the listings; no downloads.
+
+The `--staged-rebuild`, `--game`, `--max-runtime-minutes`, and
+`--finalize-rebuild` flags are internal workflow plumbing. Do not use them for an
+ordinary local or incremental build.
 
 ### Builder state (`builder-state.db`)
 

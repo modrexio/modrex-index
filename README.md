@@ -8,10 +8,16 @@ A GitHub Actions workflow, triggered manually, downloads mod files from modworks
 
 The app downloads `index.db` on first launch (cached for 1 hour) and queries it with sql.js to match a file's SHA256 against a mod name, version, and modworkshop IDs.
 
+Full rebuilds are checkpointed by game in GitHub Actions because the complete build
+is longer than a hosted job can run. Intermediate SQLite databases are stored only
+as short-lived workflow artifacts; the public release is updated after all five
+games complete and the final databases pass integrity checks.
+
 ## Running locally
 
 ```bash
 pnpm install
 pnpm build-index
 pnpm build-index -- --concurrency=10
+pnpm test:staged-rebuild
 ```

@@ -25,16 +25,17 @@ import { appendFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, readdirSync
 import { execFileSync } from 'child_process'
 import { tmpdir } from 'os'
 
-const BASE = 'https://api.modworkshop.net'
+const BASE = process.env.MODWORKSHOP_API_BASE ?? 'https://api.modworkshop.net'
 const PD3_GAME_ID = 853
 const PD2_GAME_ID = 1
 const PDTH_GAME_ID = 2
 const CRIMEBOSS_GAME_ID = 857
 const RAID_GAME_ID = 543
 const USER_AGENT = 'modrex-indexer/1.0'
-const DB_PATH = join(import.meta.dirname, 'index.db')
-const STATE_DB_PATH = join(import.meta.dirname, 'builder-state.db')
-const STATS_PATH = join(import.meta.dirname, 'index-stats.json')
+const OUTPUT_DIR = process.env.MODREX_INDEX_OUTPUT_DIR ?? import.meta.dirname
+const DB_PATH = join(OUTPUT_DIR, 'index.db')
+const STATE_DB_PATH = join(OUTPUT_DIR, 'builder-state.db')
+const STATS_PATH = join(OUTPUT_DIR, 'index-stats.json')
 // Faster than full_rebuild when adding a new format: only unindexed files are downloaded.
 const BACKFILL = process.argv.includes('--backfill')
 // Patches only the version column on existing rows from the listings — no downloads, no
@@ -44,6 +45,14 @@ const REPAIR_VERSIONS = process.argv.includes('--repair-versions')
 // backfill cost). Escape hatch for the cases a check can wrongly suppress: a corrupt download
 // recorded as zero-yield, or a mod change that didn't touch its updated_at.
 const RECHECK_ALL = process.argv.includes('--recheck-all')
+const STAGED_REBUILD = process.argv.includes('--staged-rebuild')
+const FINALIZE_REBUILD = process.argv.includes('--finalize-rebuild')
+const SELECTED_GAME = process.argv.find((a) => a.startsWith('--game='))?.split('=')[1] ?? null
+const VALID_GAMES = ['pd3', 'pd2', 'pdth', 'cb', 'raid'] as const
+type GameSlug = (typeof VALID_GAMES)[number]
+const MAX_RUNTIME_MINUTES = parseFloat(
+    process.argv.find((a) => a.startsWith('--max-runtime-minutes='))?.split('=')[1] ?? '0'
+)
 const CONCURRENCY = parseInt(
     process.argv.find((a) => a.startsWith('--concurrency='))?.split('=')[1] ?? (BACKFILL ? '10' : '5')
 )
@@ -403,16 +412,22 @@ async function apiGet<T>(path: string, params?: Record<string, unknown>): Promis
             }
             throw e
         }
-        if (res.status === 429) {
-            const wait = 2_000 * 2 ** attempt
-            console.warn(`  [429] ${path} — retrying in ${wait}ms`)
-            await delay(wait)
-            continue
+        if (res.status === 408 || res.status === 429 || res.status >= 500) {
+            if (attempt < 4) {
+                const retryAfter = Number(res.headers.get('retry-after'))
+                const wait = Number.isFinite(retryAfter) && retryAfter > 0
+                    ? retryAfter * 1_000
+                    : 2_000 * 2 ** attempt
+                console.warn(`  [${res.status}] ${path} — retrying in ${wait}ms`)
+                await delay(wait)
+                continue
+            }
+            throw new Error(`API ${res.status}: ${path} (gave up after retries)`)
         }
         if (!res.ok) throw new Error(`API ${res.status}: ${path}`)
         return res.json() as T
     }
-    throw new Error(`API 429: ${path} (gave up after retries)`)
+    throw new Error(`API request failed after retries: ${path}`)
 }
 
 // 10-minute overlap so mods bumped during the previous run aren't missed
@@ -978,15 +993,21 @@ async function extractPd2Entries(url: string, size: number | null): Promise<Cont
 
 type Task = () => Promise<void>
 
-async function runPool(tasks: Task[], concurrency: number): Promise<void> {
+async function runPool(tasks: Task[], concurrency: number, deadline: number | null = null): Promise<boolean> {
     const queue = [...tasks]
+    let stoppedAtDeadline = false
     const workers = Array.from({ length: Math.min(concurrency, tasks.length) }, async () => {
         while (queue.length > 0) {
+            if (deadline !== null && Date.now() >= deadline) {
+                stoppedAtDeadline = true
+                return
+            }
             const task = queue.shift()!
             await task()
         }
     })
     await Promise.all(workers)
+    return !stoppedAtDeadline && queue.length === 0
 }
 
 // --- helpers ---
@@ -1012,9 +1033,48 @@ function shouldDownload(type: string): boolean {
 // --- main ---
 
 async function main(): Promise<void> {
+    if (STAGED_REBUILD) {
+        if (!SELECTED_GAME || !VALID_GAMES.includes(SELECTED_GAME as GameSlug)) {
+            throw new Error(`--staged-rebuild requires --game=${VALID_GAMES.join('|')}`)
+        }
+        if (BACKFILL || REPAIR_VERSIONS || RECHECK_ALL) {
+            throw new Error('--staged-rebuild cannot be combined with backfill, repair, or recheck modes')
+        }
+    } else if (SELECTED_GAME || FINALIZE_REBUILD || MAX_RUNTIME_MINUTES > 0) {
+        throw new Error('--game, --finalize-rebuild, and --max-runtime-minutes require --staged-rebuild')
+    }
+    if (FINALIZE_REBUILD && SELECTED_GAME !== 'raid') {
+        throw new Error('--finalize-rebuild is only valid for the final RAID stage')
+    }
+    if (!Number.isFinite(MAX_RUNTIME_MINUTES) || MAX_RUNTIME_MINUTES < 0) {
+        throw new Error('--max-runtime-minutes must be a non-negative number')
+    }
+
     console.log('Opening database...')
+    const runStartedAt = new Date()
     const { db, pd3SourceId, pd2SourceId, pdthSourceId, cbSourceId, raidSourceId } = openDb()
     const stateDb = openStateDb()
+    const rebuildStartedKey = 'staged_rebuild_started_at'
+    const rebuildCompletedKey = 'staged_rebuild_completed_games'
+    let rebuildStartedAt: string | null = null
+    let completedGames = new Set<GameSlug>()
+    if (STAGED_REBUILD) {
+        const startedRow = db.prepare('SELECT value FROM metadata WHERE key = ?').get(rebuildStartedKey) as
+            | { value: string }
+            | undefined
+        rebuildStartedAt = startedRow?.value ?? runStartedAt.toISOString()
+        db.prepare('INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)').run(
+            rebuildStartedKey,
+            rebuildStartedAt
+        )
+        const completedRow = db.prepare('SELECT value FROM metadata WHERE key = ?').get(rebuildCompletedKey) as
+            | { value: string }
+            | undefined
+        if (completedRow) {
+            completedGames = new Set(JSON.parse(completedRow.value) as GameSlug[])
+        }
+        console.log(`  Staged full rebuild: ${SELECTED_GAME} (started ${rebuildStartedAt})`)
+    }
     const pd3Checks = loadModChecks(stateDb, pd3SourceId)
     const pd2Checks = loadModChecks(stateDb, pd2SourceId)
     const pdthChecks = loadModChecks(stateDb, pdthSourceId)
@@ -1095,34 +1155,27 @@ async function main(): Promise<void> {
         "UPDATE files SET entry_name = ? WHERE mod_id = ? AND sha256 = ? AND entry_name = ''"
     )
 
-    const runStartedAt = new Date()
     const errors: string[] = []
     let newFiles = 0
     let filledNames = 0
 
     // Fetch both mod lists before building tasks so closures can reference both lengths.
     // Repair scans every mod (since = null) so it can correct any stale version.
-    const since = BACKFILL || REPAIR_VERSIONS ? null : lastRunAt
+    const since = STAGED_REBUILD || BACKFILL || REPAIR_VERSIONS ? null : lastRunAt
     const { pd3Mods, pd2Mods, pdthMods, cbMods, raidMods } = await timePhase('listing', async () => {
-        console.log('Fetching PD3 mod list...')
-        const pd3Mods = await listModsSince(PD3_GAME_ID, since)
-        console.log(`  ${pd3Mods.length} PD3 mods to process\n`)
-
-        console.log('Fetching PD2 mod list...')
-        const pd2Mods = await listModsSince(PD2_GAME_ID, since)
-        console.log(`  ${pd2Mods.length} PD2 mods to process\n`)
-
-        console.log('Fetching PDTH mod list...')
-        const pdthMods = await listModsSince(PDTH_GAME_ID, since)
-        console.log(`  ${pdthMods.length} PDTH mods to process\n`)
-
-        console.log('Fetching Crime Boss mod list...')
-        const cbMods = await listModsSince(CRIMEBOSS_GAME_ID, since)
-        console.log(`  ${cbMods.length} Crime Boss mods to process\n`)
-
-        console.log('Fetching RAID mod list...')
-        const raidMods = await listModsSince(RAID_GAME_ID, since)
-        console.log(`  ${raidMods.length} RAID mods to process\n`)
+        const selected = (game: GameSlug) => !STAGED_REBUILD || SELECTED_GAME === game
+        const list = async (game: GameSlug, gameId: number, label: string): Promise<Mod[]> => {
+            if (!selected(game)) return []
+            console.log(`Fetching ${label} mod list...`)
+            const mods = await listModsSince(gameId, since)
+            console.log(`  ${mods.length} ${label} mods to process\n`)
+            return mods
+        }
+        const pd3Mods = await list('pd3', PD3_GAME_ID, 'PD3')
+        const pd2Mods = await list('pd2', PD2_GAME_ID, 'PD2')
+        const pdthMods = await list('pdth', PDTH_GAME_ID, 'PDTH')
+        const cbMods = await list('cb', CRIMEBOSS_GAME_ID, 'Crime Boss')
+        const raidMods = await list('raid', RAID_GAME_ID, 'RAID')
         return { pd3Mods, pd2Mods, pdthMods, cbMods, raidMods }
     })
 
@@ -1646,8 +1699,14 @@ async function main(): Promise<void> {
     console.log(
         `Processing ${pd3Mods.length} PD3 + ${pd2Mods.length} PD2 + ${pdthMods.length} PDTH + ${cbMods.length} CB + ${raidMods.length} RAID mods with ${CONCURRENCY} workers...\n`
     )
-    await timePhase('processing', () =>
-        runPool([...pd3Tasks, ...pd2Tasks, ...pdthTasks, ...cbTasks, ...raidTasks], CONCURRENCY)
+    const deadline =
+        MAX_RUNTIME_MINUTES > 0 ? runStartedAt.getTime() + MAX_RUNTIME_MINUTES * 60_000 : null
+    const processingComplete = await timePhase('processing', () =>
+        runPool(
+            [...pd3Tasks, ...pd2Tasks, ...pdthTasks, ...cbTasks, ...raidTasks],
+            CONCURRENCY,
+            deadline
+        )
     )
 
     // Prune childless mods rows left by older builds (a mod inserted before the
@@ -1660,23 +1719,64 @@ async function main(): Promise<void> {
         .run().changes
     if (prunedChildless > 0) console.log(`  Pruned ${prunedChildless} childless mod row(s).`)
 
-    db.prepare('INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)').run(
-        'last_run_at',
-        runStartedAt.toISOString()
-    )
-
     const total = (db.prepare('SELECT COUNT(*) as n FROM files').get() as { n: number }).n
-    const stats = writeIndexStats(db, runStartedAt.toISOString())
     console.log(
         `\nDone. ${total} files in index.db (${newFiles} new, ${filledNames} names filled this run)`
     )
-    console.log(`Wrote index-stats.json (${stats.supportedMods} supported mods).`)
 
     if (errors.length > 0) {
         console.log(`\n${errors.length} errors:`)
         errors.forEach((e) => console.log(`  - ${e}`))
     }
 
+    if (STAGED_REBUILD) {
+        if (!processingComplete) {
+            console.log(`Reached the ${MAX_RUNTIME_MINUTES}-minute stage limit — checkpointing for the next job.`)
+            writeRunSummary(`staged-rebuild-${SELECTED_GAME}-checkpoint`, newFiles, filledNames, errors.length)
+            db.pragma('wal_checkpoint(TRUNCATE)')
+            stateDb.pragma('wal_checkpoint(TRUNCATE)')
+            db.close()
+            stateDb.close()
+            process.exit(3)
+        }
+
+        completedGames.add(SELECTED_GAME as GameSlug)
+        db.prepare('INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)').run(
+            rebuildCompletedKey,
+            JSON.stringify([...completedGames])
+        )
+
+        if (FINALIZE_REBUILD) {
+            const missingGames = VALID_GAMES.filter((game) => !completedGames.has(game))
+            if (missingGames.length > 0) {
+                throw new Error(`Cannot finalize staged rebuild; missing completed stages: ${missingGames.join(', ')}`)
+            }
+            db.prepare('INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)').run(
+                'last_run_at',
+                rebuildStartedAt
+            )
+            db.prepare('DELETE FROM metadata WHERE key IN (?, ?)').run(
+                rebuildStartedKey,
+                rebuildCompletedKey
+            )
+            const stats = writeIndexStats(db, rebuildStartedAt)
+            console.log(`Wrote index-stats.json (${stats.supportedMods} supported mods).`)
+        }
+
+        writeRunSummary(`staged-rebuild-${SELECTED_GAME}`, newFiles, filledNames, errors.length)
+        db.pragma('wal_checkpoint(TRUNCATE)')
+        stateDb.pragma('wal_checkpoint(TRUNCATE)')
+        db.close()
+        stateDb.close()
+        return
+    }
+
+    db.prepare('INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)').run(
+        'last_run_at',
+        runStartedAt.toISOString()
+    )
+    const stats = writeIndexStats(db, runStartedAt.toISOString())
+    console.log(`Wrote index-stats.json (${stats.supportedMods} supported mods).`)
     writeRunSummary(BACKFILL ? 'backfill' : 'incremental', newFiles, filledNames, errors.length)
 
     db.close()

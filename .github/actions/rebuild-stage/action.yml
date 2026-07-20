@@ -1,0 +1,119 @@
+name: Run rebuild stage
+description: Process one game and persist the SQLite checkpoint as a workflow artifact
+
+inputs:
+  game:
+    description: Game slug to process
+    required: true
+  input-artifact:
+    description: Artifact containing the previous stage checkpoint
+    required: false
+    default: ''
+  output-artifact:
+    description: Artifact name for this stage checkpoint
+    required: true
+  max-runtime-minutes:
+    description: Graceful processing limit before checkpointing
+    required: false
+    default: ''
+  finalize:
+    description: Finalize metadata and write index-stats.json
+    required: false
+    default: 'false'
+  concurrency:
+    description: Storage download parallelism
+    required: false
+    default: ''
+
+outputs:
+  complete:
+    description: Whether every mod for this game was processed
+    value: ${{ steps.indexer.outputs.complete }}
+
+runs:
+  using: composite
+  steps:
+    - uses: pnpm/action-setup@v4
+      with:
+        version: 10.32.1
+
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 22
+        cache: pnpm
+
+    - name: Install system dependencies
+      shell: bash
+      run: sudo apt-get install -y p7zip-full
+
+    - name: Install dependencies
+      shell: bash
+      run: pnpm install
+
+    - name: Download previous checkpoint
+      if: ${{ inputs.input-artifact != '' }}
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs.input-artifact }}
+        path: .
+
+    - name: Run indexer stage
+      id: indexer
+      shell: bash
+      env:
+        STAGE_GAME: ${{ inputs.game }}
+        STAGE_MAX_RUNTIME: ${{ inputs.max-runtime-minutes }}
+        STAGE_FINALIZE: ${{ inputs.finalize }}
+        STAGE_CONCURRENCY: ${{ inputs.concurrency }}
+      run: |
+        args=(--staged-rebuild "--game=$STAGE_GAME")
+        [ -n "$STAGE_MAX_RUNTIME" ] && args+=("--max-runtime-minutes=$STAGE_MAX_RUNTIME")
+        [ "$STAGE_FINALIZE" = true ] && args+=(--finalize-rebuild)
+        [ -n "$STAGE_CONCURRENCY" ] && args+=("--concurrency=$STAGE_CONCURRENCY")
+
+        set +e
+        pnpm build-index -- "${args[@]}"
+        code=$?
+        set -e
+
+        if [ "$code" -ne 0 ] && [ "$code" -ne 3 ]; then
+          exit "$code"
+        fi
+        if [ "$STAGE_FINALIZE" = true ] && [ "$code" -ne 0 ]; then
+          echo "Final rebuild stage did not complete."
+          exit 1
+        fi
+        echo "complete=$([ "$code" -eq 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+    - name: Validate checkpoint
+      shell: bash
+      env:
+        STAGE_FINALIZE: ${{ inputs.finalize }}
+      run: |
+        node - <<'NODE'
+        const Database = require('better-sqlite3')
+        for (const path of ['index.db', 'builder-state.db']) {
+          const db = new Database(path, { readonly: true })
+          if (db.pragma('integrity_check', { simple: true }) !== 'ok') {
+            throw new Error(`${path} failed integrity_check`)
+          }
+          db.close()
+        }
+        NODE
+        if [ "$STAGE_FINALIZE" = true ]; then
+          test -f index-stats.json
+          node -e "JSON.parse(require('fs').readFileSync('index-stats.json', 'utf8'))"
+        fi
+
+    - name: Upload checkpoint
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.output-artifact }}
+        path: |
+          index.db
+          builder-state.db
+          index-stats.json
+        if-no-files-found: error
+        retention-days: 2
+        compression-level: 6
+        overwrite: true
