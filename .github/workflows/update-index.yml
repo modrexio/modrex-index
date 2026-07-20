@@ -131,18 +131,14 @@ jobs:
         if: steps.indexer.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release upload latest-index index.db --clobber 2>/dev/null || \
-            gh release create latest-index index.db \
-              --title "Latest mod index" \
-              --notes "Auto-updated PD2 + PD3 mod hash index for modrex."
+        run: bash .github/scripts/publish-release-asset.sh latest-index index.db
 
       - name: Upload index stats
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           test -f index-stats.json
-          gh release upload latest-index index-stats.json --clobber
+          bash .github/scripts/publish-release-asset.sh latest-index index-stats.json
 
       - name: Upload builder state
         env:
@@ -151,5 +147,5 @@ jobs:
           # Uploaded on exit 0 and 2 alike — check state advances even when no new files
           # were indexed (that's the entire point of a no-op run finishing fast next time).
           if [ -f builder-state.db ]; then
-            gh release upload latest-index builder-state.db --clobber
+            bash .github/scripts/publish-release-asset.sh latest-index builder-state.db
           fi
